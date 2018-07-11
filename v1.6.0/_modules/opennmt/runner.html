@@ -168,6 +168,8 @@
 
 <span class="kn">from</span> <span class="nn">tensorflow.python.estimator.util</span> <span class="k">import</span> <span class="n">fn_args</span>
 
+<span class="kn">from</span> <span class="nn">google.protobuf</span> <span class="k">import</span> <span class="n">text_format</span>
+
 <span class="kn">from</span> <span class="nn">opennmt.utils</span> <span class="k">import</span> <span class="n">hooks</span><span class="p">,</span> <span class="n">checkpoint</span>
 <span class="kn">from</span> <span class="nn">opennmt.utils.evaluator</span> <span class="k">import</span> <span class="n">external_evaluation_fn</span>
 <span class="kn">from</span> <span class="nn">opennmt.utils.misc</span> <span class="k">import</span> <span class="n">extract_batches</span><span class="p">,</span> <span class="n">print_bytes</span>
@@ -204,6 +206,23 @@
         <span class="n">log_device_placement</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">gpu_options</span><span class="o">=</span><span class="n">tf</span><span class="o">.</span><span class="n">GPUOptions</span><span class="p">(</span>
             <span class="n">allow_growth</span><span class="o">=</span><span class="n">gpu_allow_growth</span><span class="p">))</span>
+
+    <span class="c1"># Disable layout optimizer for better conv1d performance, see:</span>
+    <span class="c1"># https://github.com/tensorflow/tensorflow/issues/20309</span>
+    <span class="c1"># This field does not exist in TensorFlow 1.4, so guard against the</span>
+    <span class="c1"># exception.</span>
+    <span class="k">try</span><span class="p">:</span>
+      <span class="n">rewrite_options</span> <span class="o">=</span> <span class="n">text_format</span><span class="o">.</span><span class="n">Parse</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">          graph_options {</span>
+<span class="s2">            rewrite_options {</span>
+<span class="s2">              layout_optimizer: OFF</span>
+<span class="s2">            }</span>
+<span class="s2">          }</span>
+<span class="s2">          &quot;&quot;&quot;</span><span class="p">,</span> <span class="n">tf</span><span class="o">.</span><span class="n">ConfigProto</span><span class="p">())</span>
+      <span class="n">session_config_base</span><span class="o">.</span><span class="n">MergeFrom</span><span class="p">(</span><span class="n">rewrite_options</span><span class="p">)</span>
+    <span class="k">except</span> <span class="n">text_format</span><span class="o">.</span><span class="n">ParseError</span><span class="p">:</span>
+      <span class="k">pass</span>
+
     <span class="k">if</span> <span class="n">session_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
       <span class="n">session_config_base</span><span class="o">.</span><span class="n">MergeFrom</span><span class="p">(</span><span class="n">session_config</span><span class="p">)</span>
     <span class="n">session_config</span> <span class="o">=</span> <span class="n">session_config_base</span>
