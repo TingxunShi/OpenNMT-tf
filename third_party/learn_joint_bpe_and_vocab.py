@@ -35,19 +35,20 @@ Proceedings of the 54th Annual Meeting of the Association for Computational Ling
 
 from __future__ import unicode_literals
 
-import sys
-import os
-import codecs
 import argparse
+import codecs
+import os
+import sys
 import tempfile
 from collections import Counter
-
-import learn_bpe
-import apply_bpe
-
 # hack for python2/3 compatibility
 from io import open
+
+import apply_bpe
+import learn_bpe
+
 argparse.open = open
+
 
 def create_parser():
     parser = argparse.ArgumentParser(
@@ -55,7 +56,7 @@ def create_parser():
         description="learn BPE-based word segmentation")
 
     parser.add_argument(
-        '--input', '-i', type=argparse.FileType('r'), required=True, nargs = '+',
+        '--input', '-i', type=argparse.FileType('r'), required=True, nargs='+',
         metavar='PATH',
         help="Input texts (multiple allowed).")
     parser.add_argument(
@@ -69,7 +70,7 @@ def create_parser():
         '--separator', type=str, default='@@', metavar='STR',
         help="Separator between non-final subword units (default: '%(default)s'))")
     parser.add_argument(
-        '--write-vocabulary', type=argparse.FileType('w'), nargs = '+', default=None,
+        '--write-vocabulary', type=argparse.FileType('w'), nargs='+', default=None,
         metavar='PATH', dest='vocab',
         help='Write to these vocabulary files after applying BPE. One per input text. Used for filtering in apply_bpe.py')
     parser.add_argument(
@@ -80,7 +81,6 @@ def create_parser():
         help="verbose mode.")
 
     return parser
-
 
 
 if __name__ == '__main__':

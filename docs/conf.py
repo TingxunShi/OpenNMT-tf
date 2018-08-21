@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import sys
 import re
+import sys
+
 sys.path.insert(0, "..")
 sys.path.insert(0, ".")
-
 
 # General information about the project.
 project = "OpenNMT-tf"
@@ -30,7 +29,7 @@ extensions = [
 
 source_suffix = [".rst", ".md"]
 source_parsers = {
-   ".md": "recommonmark.parser.CommonMarkParser",
+    ".md": "recommonmark.parser.CommonMarkParser",
 }
 
 # Add any paths that contain templates here, relative to this directory.
@@ -66,5 +65,6 @@ scv_whitelist_tags = (re.compile(r'^v\d+\.\d+\.0$'),)
 scv_sort = ("semver",)
 scv_greatest_tag = True
 
+
 def setup(app):
-  app.add_stylesheet("custom.css")
+    app.add_stylesheet("custom.css")
