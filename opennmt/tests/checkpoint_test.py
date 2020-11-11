@@ -1,42 +1,94 @@
 import os
 
 import tensorflow as tf
-import numpy as np
 
-from opennmt.utils import checkpoint
-from opennmt.utils.vocab import Vocab
+from opennmt.utils import checkpoint as checkpoint_util
+
+
+class _CustomDense(tf.keras.layers.Dense):
+
+  def add_weight(self, name, *args, **kwargs):
+    # This is to test the case where the variable name is different than the attribute name.
+    name += "_1"
+    return super(_CustomDense, self).add_weight(name, *args, **kwargs)
+
+class _DummyModel(tf.keras.layers.Layer):
+
+  def __init__(self):
+    super(_DummyModel, self).__init__()
+    self.layers = [tf.keras.layers.Dense(20), _CustomDense(20)]
+
+  def call(self, x):
+    for layer in self.layers:
+      x = layer(x)
+    return x
 
 
 class CheckpointTest(tf.test.TestCase):
 
-  def _saveVocab(self, name, words):
-    vocab = Vocab()
-    for word in words:
-      vocab.add(str(word))
-    vocab_file = os.path.join(self.get_temp_dir(), name)
-    vocab.serialize(vocab_file)
-    return vocab_file
+  def testLastSavedStep(self):
+    model = _DummyModel()
+    model(tf.random.uniform([4, 10]))
+    model_dir = os.path.join(self.get_temp_dir(), "model")
+    checkpoint = checkpoint_util.Checkpoint(model, model_dir=model_dir)
+    self.assertIsNone(checkpoint.last_saved_step)
+    checkpoint.save(10)
+    self.assertEqual(checkpoint.last_saved_step, 10)
+    checkpoint.save(20)
+    self.assertEqual(checkpoint.last_saved_step, 20)
 
-  def testVocabMappingMerge(self):
-    old = self._saveVocab("old", [1, 2, 3, 4])
-    new = self._saveVocab("new", [1, 6, 3, 5, 7])
-    mapping = checkpoint._get_vocabulary_mapping(old, new, "merge")
-    self.assertEqual(4 + 5 - 2 + 1, len(mapping))  # old + new - common + <unk>
-    self.assertAllEqual([0, 1, 2, 3, -1, -1, -1, 4], mapping)
+    # Property should not be bound to an instance.
+    checkpoint = checkpoint_util.Checkpoint(model, model_dir=model_dir)
+    self.assertEqual(checkpoint.last_saved_step, 20)
 
-  def testVocabMappingReplace(self):
-    old = self._saveVocab("old", [1, 2, 3, 4])
-    new = self._saveVocab("new", [1, 6, 5, 3, 7])
-    mapping = checkpoint._get_vocabulary_mapping(old, new, "replace")
-    self.assertEqual(5 + 1, len(mapping))  # new + <unk>
-    self.assertAllEqual([0, -1, -1, 2, -1, 4], mapping)
+  def testCheckpointAveraging(self):
+    model = _DummyModel()
+    optimizer = tf.keras.optimizers.Adam()
 
-  def testVocabVariableUpdate(self):
-    mapping = [0, -1, -1, 2, -1, 4]
-    old = np.array([1, 2, 3, 4, 5, 6, 7])
-    vocab_size = 7
-    new = checkpoint._update_vocabulary_variable(old, vocab_size, mapping)
-    self.assertAllEqual([1, 0, 0, 3, 0, 5], new)
+    @tf.function
+    def _build_model():
+      x = tf.random.uniform([4, 10])
+      y = model(x)
+      loss = tf.reduce_mean(y)
+      gradients = optimizer.get_gradients(loss, model.trainable_variables)
+      optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+    def _assign_var(var, scalar):
+      var.assign(tf.ones_like(var) * scalar)
+
+    def _all_equal(var, scalar):
+      return tf.size(tf.where(tf.not_equal(var, scalar))).numpy() == 0
+
+    def _get_var_list(checkpoint_path):
+      return [name for name, _ in tf.train.list_variables(checkpoint_path)]
+
+    _build_model()
+
+    # Write some checkpoint with all variables set to the step value.
+    steps = [10, 20, 30, 40]
+    num_checkpoints = len(steps)
+    avg_value = sum(steps) / num_checkpoints
+    directory = os.path.join(self.get_temp_dir(), "src")
+    checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
+    checkpoint_manager = tf.train.CheckpointManager(
+        checkpoint, directory, max_to_keep=num_checkpoints)
+    for step in steps:
+      _assign_var(model.layers[0].kernel, step)
+      _assign_var(model.layers[0].bias, step)
+      checkpoint_manager.save(checkpoint_number=step)
+
+    output_dir = os.path.join(self.get_temp_dir(), "dst")
+    checkpoint_util.average_checkpoints(
+        directory, output_dir, dict(model=model, optimizer=optimizer))
+    avg_checkpoint = tf.train.latest_checkpoint(output_dir)
+    self.assertIsNotNone(avg_checkpoint)
+    self.assertEqual(checkpoint_util.get_step_from_checkpoint_prefix(avg_checkpoint), steps[-1])
+    checkpoint.restore(avg_checkpoint)
+    self.assertTrue(_all_equal(model.layers[0].kernel, avg_value))
+    self.assertTrue(_all_equal(model.layers[0].bias, avg_value))
+    self.assertListEqual(
+        _get_var_list(avg_checkpoint),
+        _get_var_list(checkpoint_manager.latest_checkpoint))
 
 
 if __name__ == "__main__":

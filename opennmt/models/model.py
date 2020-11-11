@@ -1,488 +1,426 @@
 """Base class for models."""
 
-from __future__ import print_function
-
 import abc
-import six
 
 import tensorflow as tf
 
-from opennmt.utils import data, hooks
-from opennmt.utils.optim import optimize
-from opennmt.utils.misc import item_or_tuple
-from opennmt.utils.parallel import GraphDispatcher
+from opennmt import optimizers
+from opennmt import schedules
+from opennmt.utils import exporters
+from opennmt.utils import losses
+from opennmt.utils import misc
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Model(object):
+class Model(tf.keras.layers.Layer):
   """Base class for models."""
 
-  def __init__(self,
-               name,
-               features_inputter=None,
-               labels_inputter=None,
-               daisy_chain_variables=False,
-               dtype=None):
-    self.name = name
-    self.features_inputter = features_inputter
-    self.labels_inputter = labels_inputter
-    self.daisy_chain_variables = daisy_chain_variables
-    if dtype is None and self.features_inputter is not None:
-      self.dtype = features_inputter.dtype
-    else:
-      self.dtype = dtype or tf.float32
+  def __init__(self, examples_inputter):
+    super(Model, self).__init__()
+    self.examples_inputter = examples_inputter
+    self.params = {}
 
-  def __call__(self, features, labels, params, mode, config=None):
-    """Calls the model function.
+  @property
+  def unsupervised(self):
+    """Unsupervised model."""
+    return self.labels_inputter is None
 
-    Returns:
-      outputs: The model outputs (usually unscaled probabilities).
-        Optional if :obj:`mode` is ``tf.estimator.ModeKeys.PREDICT``.
-      predictions: The model predictions.
-        Optional if :obj:`mode` is ``tf.estimator.ModeKeys.TRAIN``.
+  @property
+  def features_inputter(self):
+    """The inputter producing features."""
+    return getattr(self.examples_inputter, "features_inputter", self.examples_inputter)
 
-    See Also:
-      ``tf.estimator.Estimator`` 's ``model_fn`` argument for more details about
-      the arguments of this function.
-    """
-    return self._build(features, labels, params, mode, config=config)
+  @property
+  def labels_inputter(self):
+    """The inputter producing labels."""
+    return getattr(self.examples_inputter, "labels_inputter", None)
 
-  def model_fn(self, num_devices=1, eval_prediction_hooks_fn=None):
-    """Returns the model function.
-
-    Args:
-      num_devices: The number of devices used for training.
-      eval_prediction_hooks_fn: A callable that takes the model predictions
-        during evaluation and return an iterable of evaluation hooks (e.g. for
-        saving predictions on disk, running external evaluators, etc.).
-
-    See Also:
-      ``tf.estimator.Estimator`` 's ``model_fn`` argument for more details about
-      arguments and the returned value.
-    """
-    dispatcher = GraphDispatcher(
-        num_devices, daisy_chain_variables=self.daisy_chain_variables)
-
-    def _loss_op(features, labels, params, mode, config):
-      """Single callable to compute the loss."""
-      logits, _ = self._build(features, labels, params, mode, config=config)
-      return self._compute_loss(features, labels, logits, params, mode)
-
-    def _normalize_loss(num, den=None):
-      """Normalizes the loss."""
-      if isinstance(num, list):  # Sharded mode.
-        if den is not None:
-          assert isinstance(den, list)
-          return tf.add_n(num) / tf.add_n(den)
-        else:
-          return tf.reduce_mean(num)
-      elif den is not None:
-        return num / den
-      else:
-        return num
-
-    def _extract_loss(loss):
-      """Extracts and summarizes the loss."""
-      if not isinstance(loss, tuple):
-        actual_loss = _normalize_loss(loss)
-        tboard_loss = actual_loss
-      else:
-        actual_loss = _normalize_loss(loss[0], den=loss[1])
-        tboard_loss = _normalize_loss(loss[0], den=loss[2]) if len(loss) > 2 else actual_loss
-      tf.summary.scalar("loss", tboard_loss)
-      return actual_loss
-
-    def _model_fn(features, labels, params, mode, config):
-      """model_fn implementation."""
-      if mode == tf.estimator.ModeKeys.TRAIN:
-        counters = self._register_word_counters(features, labels)
-        counters_hook = hooks.CountersHook(
-            every_n_steps=config.save_summary_steps,
-            output_dir=config.model_dir,
-            counters=counters)
-
-        features_shards = dispatcher.shard(features)
-        labels_shards = dispatcher.shard(labels)
-
-        with tf.variable_scope(self.name, initializer=self._initializer(params)):
-          losses_shards = dispatcher(
-              _loss_op, features_shards, labels_shards, params, mode, config)
-
-        loss = _extract_loss(losses_shards)
-        train_op = optimize(loss, params, mixed_precision=(self.dtype == tf.float16))
-        return tf.estimator.EstimatorSpec(
-            mode,
-            loss=loss,
-            train_op=train_op,
-            training_hooks=[counters_hook])
-      elif mode == tf.estimator.ModeKeys.EVAL:
-        with tf.variable_scope(self.name):
-          logits, predictions = self._build(features, labels, params, mode, config=config)
-          loss = self._compute_loss(features, labels, logits, params, mode)
-
-        loss = _extract_loss(loss)
-        eval_metric_ops = self._compute_metrics(features, labels, predictions)
-        evaluation_hooks = []
-        if predictions is not None and eval_prediction_hooks_fn is not None:
-          evaluation_hooks.extend(eval_prediction_hooks_fn(predictions))
-        return tf.estimator.EstimatorSpec(
-            mode,
-            loss=loss,
-            eval_metric_ops=eval_metric_ops,
-            evaluation_hooks=evaluation_hooks)
-      elif mode == tf.estimator.ModeKeys.PREDICT:
-        with tf.variable_scope(self.name):
-          _, predictions = self._build(features, labels, params, mode, config=config)
-
-        export_outputs = {}
-        export_outputs[tf.saved_model.signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY] = (
-            tf.estimator.export.PredictOutput(predictions))
-
-        return tf.estimator.EstimatorSpec(
-            mode,
-            predictions=predictions,
-            export_outputs=export_outputs)
-      else:
-        raise RuntimeError("Invalid mode")
-
-    return _model_fn
-
-  def _initializer(self, params):
-    """Returns the global initializer for this model.
-
-    Args:
-      params: A dictionary of hyperparameters.
-
-    Returns:
-      The initializer.
-    """
-    param_init = params.get("param_init")
-    if param_init is not None:
-      return tf.random_uniform_initializer(
-          minval=-param_init, maxval=param_init, dtype=self.dtype)
+  @property
+  def ctranslate2_spec(self):
+    """The equivalent CTranslate2 model specification."""
     return None
 
-  @abc.abstractmethod
-  def _build(self, features, labels, params, mode, config=None):
-    """Creates the graph.
+  def __repr__(self):
+    """Returns a description of the model and its submodules."""
+    return misc.describe_layer(self, name="model")
+
+  def auto_config(self, num_replicas=1):
+    """Returns automatic configuration values specific to this model.
+
+    Args:
+      num_replicas: The number of synchronous model replicas used for the
+        training.
 
     Returns:
-      outputs: The model outputs (usually unscaled probabilities).
-        Optional if :obj:`mode` is ``tf.estimator.ModeKeys.PREDICT``.
-      predictions: The model predictions.
-        Optional if :obj:`mode` is ``tf.estimator.ModeKeys.TRAIN``.
+      A partial training configuration.
+    """
+    _ = num_replicas
+    return {}
+
+  def initialize(self, data_config, params=None):
+    """Initializes the model from the data configuration.
+
+    Args:
+      data_config: A dictionary containing the data configuration set
+        by the user (e.g. vocabularies, tokenization, pretrained embeddings,
+        etc.).
+      params: A dictionary of hyperparameters.
+    """
+    if params is None:
+      params = {}
+    self.params.update(params)
+    dropout = self.params.get("dropout")
+    if dropout is not None:
+      misc.set_dropout(self, dropout)
+    self.examples_inputter.initialize(data_config)
+
+  def build(self, input_shape):
+    freeze_layers = self.params.get("freeze_layers")
+    if freeze_layers:
+      if not isinstance(freeze_layers, list):
+        freeze_layers = [freeze_layers]
+      for layer_path in freeze_layers:
+        layer = misc.index_structure(self, layer_path)
+        layer.trainable = False
+        misc.set_dropout(layer, 0)  # Disable dropout in frozen layers.
+    self.examples_inputter.build(input_shape)
+    self.built = True
+
+  @abc.abstractmethod
+  def call(self, features, labels=None, training=None, step=None):  # pylint: disable=arguments-differ
+    """Runs the model.
+
+    Args:
+      features: A nested structure of features ``tf.Tensor``.
+      labels: A nested structure of labels ``tf.Tensor``.
+      training: If ``True``, run in training mode.
+      step: The current training step.
+
+    Returns:
+      A tuple containing,
+
+      - The model outputs (usually unscaled probabilities).
+      - The model predictions.
     """
     raise NotImplementedError()
 
+  def infer(self, features):
+    """Runs inference on :obj:`features`.
+
+    This is a small convenience wrapper around
+    :meth:`opennmt.models.Model.call`.
+
+    Args:
+      features: A nested structure of features ``tf.Tensor``.
+
+    Returns:
+      The model predictions.
+    """
+    _, predictions = self(features)
+    if isinstance(features, dict) and "index" in features:
+      predictions["index"] = features["index"]
+    return predictions
+
+  def evaluate(self, features, labels):
+    """Evaluates :obj:`features` predictions against `labels`.
+
+    Args:
+      features: A nested structure of features ``tf.Tensor``.
+      labels: A nested structure of labels ``tf.Tensor``.
+
+    Returns:
+      A tuple with the loss and the model predictions.
+    """
+    outputs, predictions = self(features, labels=labels)
+    if isinstance(features, dict) and "index" in features:
+      predictions["index"] = features["index"]
+    loss = self.compute_loss(outputs, labels, training=False)
+    return loss, predictions
+
+  def score(self, features, labels):
+    """Scores labels.
+
+    Args:
+      features: A nested structure of features ``tf.Tensor``.
+      labels: A nested structure of labels ``tf.Tensor``.
+
+    Returns:
+      The score results.
+    """
+    raise NotImplementedError("This model does not define a score function")
+
   @abc.abstractmethod
-  def _compute_loss(self, features, labels, outputs, params, mode):
+  def compute_loss(self, outputs, labels, training=True):
     """Computes the loss.
 
     Args:
-      features: The dict of features ``tf.Tensor``.
+      outputs: The model outputs (usually unscaled probabilities).
       labels: The dict of labels ``tf.Tensor``.
-      output: The model outputs (usually unscaled probabilities).
-      params: A dictionary of hyperparameters.
-      mode: A ``tf.estimator.ModeKeys`` mode.
+      training: If ``True``, compute the loss for training.
 
     Returns:
-      The loss or a tuple containing the computed loss and the loss to display.
+      The loss or a tuple ``(numerator, train_denominator, stats_denominator)``
+      to use a different normalization for training compared to reporting (e.g.
+      batch-normalized for training vs. token-normalized for reporting).
     """
     raise NotImplementedError()
 
-  def _compute_metrics(self, features, labels, predictions):  # pylint: disable=unused-argument
-    """Computes additional metrics on the predictions.
+  def regularize_loss(self, loss, variables=None):
+    """Regularizes the loss.
 
     Args:
-      features: The dict of features ``tf.Tensor``.
-      labels: The dict of labels ``tf.Tensor``.
-      predictions: The model predictions.
+      loss: The loss.
+      variables: List of variables.
 
     Returns:
-      A dict of metric results (tuple ``(metric_tensor, update_op)``) keyed by
-      name.
+      The regularized loss.
+    """
+    if variables is None:
+      variables = self.trainable_variables
+    regularization = self.params.get("regularization")
+    if regularization is not None:
+      loss += losses.regularization_penalty(
+          regularization["type"], regularization["scale"], variables)
+    return loss
+
+  def get_metrics(self):
+    """Returns the metrics for this model.
+
+    Returns:
+      A dictionary of ``tf.keras.metrics.Metric`` metrics.
     """
     return None
 
-  def _register_word_counters(self, features, labels):
-    """Creates word counters for sequences (if any) of :obj:`features` and
-    :obj:`labels`.
-    """
-    features_length = self._get_features_length(features)
-    labels_length = self._get_labels_length(labels)
-
-    counters = []
-    with tf.variable_scope("words_per_sec"):
-      if features_length is not None:
-        counters.append(hooks.add_counter("features", tf.reduce_sum(features_length)))
-      if labels_length is not None:
-        counters.append(hooks.add_counter("labels", tf.reduce_sum(labels_length)))
-    return counters
-
-  def _initialize(self, metadata):
-    """Runs model specific initialization (e.g. vocabularies loading).
+  def update_metrics(self, metrics, predictions, labels):  # pylint: disable=unused-argument
+    """Computes additional metrics on the predictions.
 
     Args:
-      metadata: A dictionary containing additional metadata set
-        by the user.
+      metrics: A dictionary of metrics to update.
+      predictions: The model predictions.
+      labels: The dict of labels ``tf.Tensor``.
     """
-    if self.features_inputter is not None:
-      self.features_inputter.initialize(metadata)
-    if self.labels_inputter is not None:
-      self.labels_inputter.initialize(metadata)
+    return
 
-  def _get_serving_input_receiver(self):
-    """Returns an input receiver for serving this model.
+  def get_optimizer(self):
+    """Returns the optimizer for this model.
 
     Returns:
-      A ``tf.estimator.export.ServingInputReceiver``.
+      A ``tf.keras.optimizers.Optimizer`` instance or ``None`` if no optimizer
+      is configured.
     """
-    if self.features_inputter is None:
-      raise NotImplementedError()
-    return self.features_inputter.get_serving_input_receiver()
-
-  def _get_features_length(self, features):
-    """Returns the features length.
-
-    Args:
-      features: A dict of ``tf.Tensor``.
-
-    Returns:
-      The length as a ``tf.Tensor`` or list of ``tf.Tensor``, or ``None`` if
-      length is undefined.
-    """
-    if self.features_inputter is None:
+    params = self.params
+    optimizer_name = params.get("optimizer")
+    if optimizer_name is None:
       return None
-    return self.features_inputter.get_length(features)
+    learning_rate = tf.constant(params["learning_rate"], dtype=tf.float32)
+    if params.get("decay_type") is not None:
+      schedule_params = params.get("decay_params", {})
+      learning_rate = schedules.make_learning_rate_schedule(
+          learning_rate,
+          params["decay_type"],
+          schedule_params=schedule_params,
+          start_step=params.get("start_decay_steps", 0),
+          minimum_learning_rate=params.get("minimum_learning_rate", 0))
+    optimizer_params = params.get("optimizer_params")
+    if optimizer_params is None:
+      optimizer_params = {}
+    optimizer = optimizers.make_optimizer(
+        optimizer_name, learning_rate, **optimizer_params)
+    return optimizer
 
-  def _get_labels_length(self, labels):
-    """Returns the labels length.
-
-    Args:
-      labels: A dict of ``tf.Tensor``.
-
-    Returns:
-      The length as a ``tf.Tensor``  or ``None`` if length is undefined.
-    """
-    if self.labels_inputter is None:
-      return None
-    return self.labels_inputter.get_length(labels)
-
-  def _get_dataset_size(self, features_file):
-    """Returns the size of the dataset.
-
-    Args:
-      features_file: The file of features.
+  def serve_function(self):
+    """Returns a function for serving this model.
 
     Returns:
-      The total size.
+      A ``tf.function``.
     """
-    if self.features_inputter is None:
-      raise NotImplementedError()
-    return self.features_inputter.get_dataset_size(features_file)
+    # Set name attribute of the input TensorSpec.
+    input_signature = {
+        name:tf.TensorSpec.from_spec(spec, name=name)
+        for name, spec in self.features_inputter.input_signature().items()}
 
-  def _get_features_builder(self, features_file):
-    """Returns the recipe to build features.
+    @tf.function(input_signature=(input_signature,))
+    def _run(features):
+      features = self.features_inputter.make_features(features=features.copy())
+      if isinstance(features, (list, tuple)):
+        # Special case for unsupervised inputters that always return a tuple (features, labels).
+        features = features[0]
+      _, predictions = self(features)
+      return predictions
+
+    return _run
+
+  def export(self, export_dir, exporter=None):
+    """Exports the model for serving.
 
     Args:
-      features_file: The file of features.
-
-    Returns:
-      A tuple ``(tf.data.Dataset, process_fn)``.
+      export_dir: The output directory.
+      exporter: A :class:`opennmt.utils.Exporter` instance. Defaults to
+        :class:`opennmt.utils.SavedModelExporter`.
     """
-    if self.features_inputter is None:
-      raise NotImplementedError()
-    dataset = self.features_inputter.make_dataset(features_file)
-    process_fn = self.features_inputter.process
-    return dataset, process_fn
+    if exporter is None:
+      exporter = exporters.SavedModelExporter()
+    exporter.export(self, export_dir)
 
-  def _get_labels_builder(self, labels_file):
-    """Returns the recipe to build labels.
+  def create_variables(self, optimizer=None):
+    """Creates the model variables by running it once.
 
     Args:
-      labels_file: The file of labels.
-
-    Returns:
-      A tuple ``(tf.data.Dataset, process_fn)``.
+      optimizer: If set, also create the optimizer variables.
     """
-    if self.labels_inputter is None:
-      raise NotImplementedError()
-    dataset = self.labels_inputter.make_dataset(labels_file)
-    process_fn = self.labels_inputter.process
-    return dataset, process_fn
+    # Create input features from the input signatures. We remove the leading
+    # batch dimension as sometimes assumed by make_features methods and set
+    # unspecified dimensions to 1.
+    features = tf.nest.map_structure(
+        lambda spec: tf.fill(
+            [dim or 1 for dim in spec.shape.as_list()[1:]],
+            tf.constant("a" if spec.dtype is tf.string else 1, dtype=spec.dtype)),
+        self.examples_inputter.input_signature())
+    features = self.examples_inputter.make_features(features=features)
 
-  def _augment_parallel_dataset(self, dataset, process_fn, mode=None):
-    """Augments a parallel dataset.
+    # Add the batch dimension back before calling the model.
+    features, labels = tf.nest.map_structure(lambda x: tf.expand_dims(x, 0), features)
+    _ = self(features, labels=labels, training=True, step=0)
+
+    if optimizer is not None:
+      optimizer._create_all_weights(self.trainable_variables)  # pylint: disable=protected-access
+
+  def transfer_weights(self, new_model, new_optimizer=None, optimizer=None, ignore_weights=None):
+    """Transfers weights (and optionally optimizer slots) from this model to
+    another.
+
+    This default implementation assumes that :obj:`self` and :obj:`new_model`
+    have exactly the same variables. Subclasses can override this method to
+    transfer weights to another model type or architecture. For example,
+    :class:`opennmt.models.SequenceToSequence` can transfer weights to a model
+    with a different vocabulary.
+
+    All model and optimizer variables are expected to be initialized.
 
     Args:
-      dataset: A parallel dataset.
-      process_fn: The current dataset processing function.
-      mode: A ``tf.estimator.ModeKeys`` mode.
-
-    Returns:
-      A tuple ``(tf.data.Dataset, process_fn)``.
+      new_model: The new model to transfer weights to.
+      new_optimizer: The new optimizer.
+      optimizer: The optimizer used for the current model.
+      ignore_weights: Optional list of weights to not transfer.
     """
-    _ = mode
-    return dataset, process_fn
+    if type(self) is not type(new_model):
+      raise ValueError("Transferring weights to another model type is not supported")
+    if ignore_weights is None:
+      ignore_weights = set()
+    ignore_weights_ref = set(weight.ref() for weight in ignore_weights)
+    weights = self.weights
+    new_weights = new_model.weights
+    for weight, new_weight in zip(weights, new_weights):
+      if new_weight.ref() not in ignore_weights_ref:
+        new_weight.assign(weight)
+        if new_optimizer is not None and optimizer is not None:
+          for slot_name in new_optimizer.get_slot_names():
+            if slot_name not in optimizer.get_slot_names():
+              continue
+            new_slot = new_optimizer.get_slot(new_weight, slot_name)
+            slot = optimizer.get_slot(weight, slot_name)
+            new_slot.assign(slot)
 
-  def _input_fn_impl(self,
-                     mode,
-                     batch_size,
-                     metadata,
-                     features_file,
-                     labels_file=None,
-                     batch_type="examples",
-                     batch_multiplier=1,
-                     bucket_width=None,
-                     single_pass=False,
-                     num_threads=None,
-                     sample_buffer_size=None,
-                     prefetch_buffer_size=None,
-                     maximum_features_length=None,
-                     maximum_labels_length=None):
-    """See ``input_fn``."""
-    self._initialize(metadata)
-
-    feat_dataset, feat_process_fn = self._get_features_builder(features_file)
-
-    if labels_file is None:
-      dataset = feat_dataset
-      # Parallel inputs must be catched in a single tuple and not considered as multiple arguments.
-      process_fn = lambda *arg: feat_process_fn(item_or_tuple(arg))
-    else:
-      labels_dataset, labels_process_fn = self._get_labels_builder(labels_file)
-
-      dataset = tf.data.Dataset.zip((feat_dataset, labels_dataset))
-      process_fn = lambda features, labels: (
-          feat_process_fn(features), labels_process_fn(labels))
-      dataset, process_fn = self._augment_parallel_dataset(dataset, process_fn, mode=mode)
-
-    if mode == tf.estimator.ModeKeys.TRAIN:
-      dataset = data.training_pipeline(
-          dataset,
-          batch_size,
-          batch_type=batch_type,
-          batch_multiplier=batch_multiplier,
-          bucket_width=bucket_width,
-          single_pass=single_pass,
-          process_fn=process_fn,
-          num_threads=num_threads,
-          shuffle_buffer_size=sample_buffer_size,
-          prefetch_buffer_size=prefetch_buffer_size,
-          dataset_size=self._get_dataset_size(features_file),
-          maximum_features_length=maximum_features_length,
-          maximum_labels_length=maximum_labels_length,
-          features_length_fn=self._get_features_length,
-          labels_length_fn=self._get_labels_length)
-    else:
-      dataset = data.inference_pipeline(
-          dataset,
-          batch_size,
-          process_fn=process_fn,
-          num_threads=num_threads,
-          prefetch_buffer_size=prefetch_buffer_size)
-
-    iterator = dataset.make_initializable_iterator()
-
-    # Add the initializer to a standard collection for it to be initialized.
-    tf.add_to_collection(tf.GraphKeys.TABLE_INITIALIZERS, iterator.initializer)
-
-    return iterator.get_next()
-
-  def input_fn(self,
-               mode,
-               batch_size,
-               metadata,
-               features_file,
-               labels_file=None,
-               batch_type="examples",
-               batch_multiplier=1,
-               bucket_width=None,
-               single_pass=False,
-               num_threads=None,
-               sample_buffer_size=None,
-               prefetch_buffer_size=None,
-               maximum_features_length=None,
-               maximum_labels_length=None):
-    """Returns an input function.
+  def map_v1_weights(self, weights):
+    """Maps current weights to V1 weights.
 
     Args:
-      mode: A ``tf.estimator.ModeKeys`` mode.
-      batch_size: The batch size to use.
-      metadata: A dictionary containing additional metadata set
-        by the user.
-      features_file: The file containing input features.
-      labels_file: The file containing output labels.
-      batch_type: The training batching stragety to use: can be "examples" or
-        "tokens".
-      batch_multiplier: The batch size multiplier to prepare splitting accross
-         replicated graph parts.
-      bucket_width: The width of the length buckets to select batch candidates
-        from. ``None`` to not constrain batch formation.
-      single_pass: If ``True``, makes a single pass over the training data.
-      num_threads: The number of elements processed in parallel.
-      sample_buffer_size: The number of elements from which to sample.
-      prefetch_buffer_size: The number of batches to prefetch asynchronously. If
-        ``None``, use an automatically tuned value on TensorFlow 1.8+ and 1 on
-        older versions.
-      maximum_features_length: The maximum length or list of maximum lengths of
-        the features sequence(s). ``None`` to not constrain the length.
-      maximum_labels_length: The maximum length of the labels sequence.
-        ``None`` to not constrain the length.
+      weights: A nested dictionary following the scope names used in V1. The
+        leaves are tuples with the variable value and optionally the optimizer
+        slots.
 
     Returns:
-      A callable that returns the next element.
-
-    Raises:
-      ValueError: if :obj:`labels_file` is not set when in training or
-        evaluation mode.
-
-    See Also:
-      ``tf.estimator.Estimator``.
+      A list of tuples associating variables and their V1 equivalent.
     """
-    if mode != tf.estimator.ModeKeys.PREDICT and labels_file is None:
-      raise ValueError("Labels file is required for training and evaluation")
+    raise NotImplementedError("This model can not restore V1 checkpoints")
 
-    return lambda: self._input_fn_impl(
-        mode,
-        batch_size,
-        metadata,
-        features_file,
-        labels_file=labels_file,
-        batch_type=batch_type,
-        batch_multiplier=batch_multiplier,
-        bucket_width=bucket_width,
-        single_pass=single_pass,
-        num_threads=num_threads,
-        sample_buffer_size=sample_buffer_size,
-        prefetch_buffer_size=prefetch_buffer_size,
-        maximum_features_length=maximum_features_length,
-        maximum_labels_length=maximum_labels_length)
-
-  def _serving_input_fn_impl(self, metadata):
-    """See ``serving_input_fn``."""
-    self._initialize(metadata)
-    return self._get_serving_input_receiver()
-
-  def serving_input_fn(self, metadata):
-    """Returns the serving input function.
+  def export_assets(self, asset_dir):
+    """Exports additional assets used by this model.
 
     Args:
-      metadata: A dictionary containing additional metadata set
-        by the user.
+      asset_dir: The directory where assets can be written.
 
     Returns:
-      A callable that returns a ``tf.estimator.export.ServingInputReceiver``.
+      A dictionary of additional assets.
     """
-    return lambda: self._serving_input_fn_impl(metadata)
+    return self.examples_inputter.export_assets(asset_dir)
+
+  def visualize(self, log_dir):
+    """Setups model visualization (e.g. word embedding projections).
+
+    Args:
+      log_dir: The log directory.
+    """
+    self.features_inputter.visualize(self, log_dir)
+    if not self.unsupervised:
+      self.labels_inputter.visualize(self, log_dir)
 
   def print_prediction(self, prediction, params=None, stream=None):
     """Prints the model prediction.
 
     Args:
-      prediction: The evaluated prediction.
+      prediction: The model prediction.
       params: (optional) Dictionary of formatting parameters.
       stream: (optional) The stream to print to.
     """
     _ = params
     print(prediction, file=stream)
+
+  def print_score(self, score, params=None, stream=None):
+    """Prints the score result.
+
+    Args:
+      score: The score result (output of :meth:`opennmt.models.Model.score`).
+      params: (optional) Dictionary of formatting parameters.
+      stream: (optional) The stream to print to.
+    """
+    _ = params
+    print(score, file=stream)
+
+
+class SequenceGenerator(Model):
+  """Base class for models generating sequences."""
+
+  @property
+  def decoder_inputter(self):
+    """The inputter used on the decoder side."""
+    return (
+        self.labels_inputter if not self.unsupervised
+        else self.features_inputter)
+
+  def score(self, features, labels):
+    outputs, _ = self(features, labels=labels)
+    cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        labels["ids_out"], outputs["logits"])
+    weights = tf.sequence_mask(labels["length"], dtype=cross_entropy.dtype)
+    masked_cross_entropy = cross_entropy * weights
+    scores = tf.reduce_sum(masked_cross_entropy, axis=1)
+    results = {
+        "cross_entropy": cross_entropy,
+        "score": scores,
+        "tokens": labels["tokens"],
+        "length": self.decoder_inputter.get_length(labels, ignore_special_tokens=True)
+    }
+    if "attention" in outputs:
+      results["attention"] = outputs["attention"]
+    return results
+
+  def print_score(self, score, params=None, stream=None):
+    if params is None:
+      params = {}
+    length = score["length"]
+    tokens = score["tokens"][:length]
+    sentence = self.decoder_inputter.tokenizer.detokenize(tokens)
+    token_level_scores = None
+    attention = None
+    if params.get("with_token_level"):
+      token_level_scores = score["cross_entropy"][:length]
+    if "attention" in score:
+      attention = score["attention"][:length]
+    alignment_type = params.get("with_alignments")
+    sentence = misc.format_translation_output(
+        sentence,
+        score=score["score"],
+        token_level_scores=token_level_scores,
+        attention=attention,
+        alignment_type=alignment_type)
+    misc.print_as_bytes(sentence, stream=stream)

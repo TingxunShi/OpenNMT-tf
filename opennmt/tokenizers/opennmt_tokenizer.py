@@ -1,51 +1,50 @@
 """Define the OpenNMT tokenizer."""
 
-import copy
-import six
+import os
+import yaml
 
 import tensorflow as tf
 
 import pyonmttok
 
-from opennmt.tokenizers.tokenizer import Tokenizer
+from opennmt.tokenizers import tokenizer
 
 
-def create_tokenizer(config):
-  """Creates a new OpenNMT tokenizer.
-
-  Args:
-    config: A dictionary of tokenization options.
-
-  Returns:
-    A ``pyonmttok.Tokenizer``.
-  """
-  kwargs = copy.deepcopy(config)
-  mode = "conservative"
-  if "mode" in kwargs:
-    mode = kwargs["mode"]
-    del kwargs["mode"]
-  return pyonmttok.Tokenizer(mode, **kwargs)
-
-
-class OpenNMTTokenizer(Tokenizer):
+@tokenizer.register_tokenizer
+class OpenNMTTokenizer(tokenizer.Tokenizer):
   """Uses the OpenNMT tokenizer."""
 
-  def __init__(self, *arg, **kwargs):
-    super(OpenNMTTokenizer, self).__init__(*arg, **kwargs)
-    self._tokenizer = create_tokenizer(self._config)
+  def __init__(self, **kwargs):
+    case_feature = kwargs.get("case_feature")
+    if case_feature:
+      raise ValueError("case_feature is not supported with OpenNMT-tf")
+    kwargs.setdefault("mode", "conservative")
+    self._config = kwargs
+    self._tokenizer = pyonmttok.Tokenizer(**kwargs)
 
-  def initialize(self, metadata):
-    super(OpenNMTTokenizer, self).initialize(metadata)
-    self._tokenizer = create_tokenizer(self._config)
-    for key, value in six.iteritems(self._config):
-      if key.endswith("path"):
-        tf.add_to_collection(tf.GraphKeys.ASSET_FILEPATHS, tf.constant(value))
+  def export_assets(self, asset_dir, asset_prefix=""):
+    assets = {}
+
+    # Extract asset files from the configuration.
+    config = self._config.copy()
+    for key, value in config.items():
+      if isinstance(value, str) and tf.io.gfile.exists(value):
+        basename = os.path.basename(value)
+        config[key] = basename  # Only save the basename.
+        assets[basename] = value
+
+    # Save the tokenizer configuration.
+    config_name = "%stokenizer_config.yml" % asset_prefix
+    config_path = os.path.join(asset_dir, config_name)
+    assets[config_name] = config_path
+    with tf.io.gfile.GFile(config_path, "w") as config_file:
+      yaml.dump(config, stream=config_file, default_flow_style=False)
+
+    return assets
 
   def _tokenize_string(self, text):
-    text = tf.compat.as_bytes(text)
     tokens, _ = self._tokenizer.tokenize(text)
-    return [tf.compat.as_text(token) for token in tokens]
+    return tokens
 
   def _detokenize_string(self, tokens):
-    tokens = [tf.compat.as_bytes(token) for token in tokens]
-    return tf.compat.as_text(self._tokenizer.detokenize(tokens))
+    return self._tokenizer.detokenize(tokens)

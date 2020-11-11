@@ -1,7 +1,6 @@
 """Define bridges: logic of passing the encoder state to the decoder."""
 
 import abc
-import six
 
 import tensorflow as tf
 
@@ -17,22 +16,25 @@ def assert_state_is_compatible(expected_state, state):
     ValueError: if the states are incompatible.
   """
   # Check structure compatibility.
-  tf.contrib.framework.nest.assert_same_structure(expected_state, state)
+  tf.nest.assert_same_structure(expected_state, state)
 
   # Check shape compatibility.
-  expected_state_flat = tf.contrib.framework.nest.flatten(expected_state)
-  state_flat = tf.contrib.framework.nest.flatten(state)
+  expected_state_flat = tf.nest.flatten(expected_state)
+  state_flat = tf.nest.flatten(state)
 
   for x, y in zip(expected_state_flat, state_flat):
-    if tf.contrib.framework.is_tensor(x):
-      tf.contrib.framework.with_same_shape(x, y)
+    if tf.is_tensor(x):
+      expected_depth = x.shape[-1]
+      depth = y.shape[-1]
+      if depth != expected_depth:
+        raise ValueError("Tensor in state has shape %s which is incompatible "
+                         "with the target shape %s" % (y.shape, x.shape))
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Bridge(object):
+class Bridge(tf.keras.layers.Layer):
   """Base class for bridges."""
 
-  def __call__(self, encoder_state, decoder_zero_state):
+  def __call__(self, encoder_state, decoder_zero_state):  # pylint: disable=arguments-differ
     """Returns the initial decoder state.
 
     Args:
@@ -42,27 +44,29 @@ class Bridge(object):
     Returns:
       The decoder initial state.
     """
-    return self._build(encoder_state, decoder_zero_state)
+    return super(Bridge, self).__call__([encoder_state, decoder_zero_state])
 
   @abc.abstractmethod
-  def _build(self, encoder_state, decoder_zero_state):
+  def call(self, states):  # pylint: disable=arguments-differ
     raise NotImplementedError()
 
 
 class CopyBridge(Bridge):
   """A bridge that passes the encoder state as is."""
 
-  def _build(self, encoder_state, decoder_zero_state):
-    assert_state_is_compatible(decoder_zero_state, encoder_state)
-    return encoder_state
+  def call(self, states):
+    encoder_state, decoder_state = states
+    assert_state_is_compatible(encoder_state, decoder_state)
+    flat_encoder_state = tf.nest.flatten(encoder_state)
+    return tf.nest.pack_sequence_as(decoder_state, flat_encoder_state)
 
 
 class ZeroBridge(Bridge):
   """A bridge that does not pass information from the encoder."""
 
-  def _build(self, encoder_state, decoder_zero_state):
+  def call(self, states):
     # Simply return the default decoder state.
-    return decoder_zero_state
+    return states[1]
 
 
 class DenseBridge(Bridge):
@@ -77,31 +81,22 @@ class DenseBridge(Bridge):
       activation: Activation function (a callable).
         Set it to ``None`` to maintain a linear activation.
     """
+    super(DenseBridge, self).__init__()
     self.activation = activation
+    self.decoder_state_sizes = None
+    self.linear = None
 
-  def _build(self, encoder_state, decoder_zero_state):
-    # Flattened states.
-    encoder_state_flat = tf.contrib.framework.nest.flatten(encoder_state)
-    decoder_state_flat = tf.contrib.framework.nest.flatten(decoder_zero_state)
+  def build(self, input_shape):
+    decoder_shape = input_shape[1]
+    self.decoder_state_sizes = [
+        shape[-1] for shape in tf.nest.flatten(decoder_shape)]
+    self.linear = tf.keras.layers.Dense(
+        sum(self.decoder_state_sizes), activation=self.activation)
 
-    # View encoder state as a single tensor.
-    encoder_state_concat = tf.concat(encoder_state_flat, 1)
-
-    # Extract decoder state sizes.
-    decoder_state_size = []
-    for tensor in decoder_state_flat:
-      decoder_state_size.append(tensor.get_shape().as_list()[-1])
-
-    decoder_total_size = sum(decoder_state_size)
-
-    # Apply linear transformation.
-    transformed = tf.layers.dense(
-        encoder_state_concat,
-        decoder_total_size,
-        activation=self.activation)
-
-    # Split resulting tensor to match the decoder state size.
-    splitted = tf.split(transformed, decoder_state_size, axis=1)
-
-    # Pack as the origial decoder state.
-    return tf.contrib.framework.nest.pack_sequence_as(decoder_zero_state, splitted)
+  def call(self, states):
+    encoder_state, decoder_state = states
+    encoder_state_flat = tf.nest.flatten(encoder_state)
+    encoder_state_single = tf.concat(encoder_state_flat, 1)
+    transformed = self.linear(encoder_state_single)
+    splitted = tf.split(transformed, self.decoder_state_sizes, axis=1)
+    return tf.nest.pack_sequence_as(decoder_state, splitted)

@@ -1,5 +1,5 @@
 #!/bin/bash
 
-onmt-main train_and_eval \
-          --model_type Transformer \
-          --config config/wmt_ende.yml config/wmt_ende_1gpu.yml
+onmt-main --model_type Transformer \
+          --config config/wmt_ende.yml --auto_config \
+          train --with_eval

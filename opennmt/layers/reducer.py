@@ -1,17 +1,16 @@
 """Define reducers: objects that merge inputs."""
 
 import abc
-import six
+import functools
 
 import tensorflow as tf
+
+from opennmt.utils import tensor as tensor_util
 
 
 def pad_in_time(x, padding_length):
   """Helper function to pad a tensor in the time dimension and retain the static depth dimension."""
-  depth = x.get_shape().as_list()[-1]
-  x = tf.pad(x, [[0, 0], [0, padding_length], [0, 0]])
-  x.set_shape((None, None, depth))
-  return x
+  return tf.pad(x, [[0, 0], [0, padding_length], [0, 0]])
 
 def align_in_time(x, length):
   """Aligns the time dimension of :obj:`x` with :obj:`length`."""
@@ -73,70 +72,56 @@ def pad_n_with_identity(inputs, sequence_lengths, identity_values=0):
       for x, length in zip(inputs, sequence_lengths)]
   return padded, max_sequence_length
 
-def roll_sequence(tensor, offsets):
-  """Shifts sequences by an offset.
 
-  Args:
-    tensor: A ``tf.Tensor`` of shape ``[batch_size, time, ...]``.
-    offsets : The offset of each sequence.
-
-  Returns:
-    A ``tf.Tensor`` of the same shape as :obj:`tensor` with sequences shifted
-    by :obj:`offsets`.
-  """
-  batch_size = tf.shape(tensor)[0]
-  time = tf.shape(tensor)[1]
-  cols, rows = tf.meshgrid(tf.range(time), tf.range(batch_size))
-  cols -= tf.expand_dims(offsets, 1)
-  cols = tf.mod(cols, time)
-  indices = tf.stack([rows, cols], axis=-1)
-  return tf.gather_nd(tensor, indices)
-
-
-@six.add_metaclass(abc.ABCMeta)
-class Reducer(object):
+class Reducer(tf.keras.layers.Layer):
   """Base class for reducers."""
 
   def zip_and_reduce(self, x, y):
-    """Zips :obj:`x` with :obj:`y` and reduces all elements."""
-    if tf.contrib.framework.nest.is_sequence(x):
-      tf.contrib.framework.nest.assert_same_structure(x, y)
+    """Zips the :obj:`x` with :obj:`y` structures together and reduces all
+    elements. If the structures are nested, they will be flattened first.
 
-      x_flat = tf.contrib.framework.nest.flatten(x)
-      y_flat = tf.contrib.framework.nest.flatten(y)
+    Args:
+      x: The first structure.
+      y: The second structure.
 
-      flat = []
-      for x_i, y_i in zip(x_flat, y_flat):
-        flat.append(self.reduce([x_i, y_i]))
+    Returns:
+      The same structure as :obj:`x` and :obj:`y` where each element from
+      :obj:`x` is reduced with the correspond element from :obj:`y`.
 
-      return tf.contrib.framework.nest.pack_sequence_as(x, flat)
-    else:
-      return self.reduce([x, y])
+    Raises:
+      ValueError: if the two structures are not the same.
+    """
+    tf.nest.assert_same_structure(x, y)
+    x_flat = tf.nest.flatten(x)
+    y_flat = tf.nest.flatten(y)
+    reduced = list(map(self, zip(x_flat, y_flat)))
+    return tf.nest.pack_sequence_as(x, reduced)
 
-  @abc.abstractmethod
-  def reduce(self, inputs):
+  def call(self, inputs, sequence_length=None):  # pylint: disable=arguments-differ
     """Reduces all input elements.
 
     Args:
       inputs: A list of ``tf.Tensor``.
+      sequence_length: The length of each input, if reducing sequences.
 
     Returns:
-      A reduced ``tf.Tensor``.
+      If :obj:`sequence_length` is set, a tuple
+      ``(reduced_input, reduced_length)``, otherwise a reduced ``tf.Tensor``
+      only.
     """
+    if sequence_length is None:
+      return self.reduce(inputs)
+    else:
+      return self.reduce_sequence(inputs, sequence_lengths=sequence_length)
+
+  @abc.abstractmethod
+  def reduce(self, inputs):
+    """See :meth:`opennmt.layers.Reducer.__call__`."""
     raise NotImplementedError()
 
   @abc.abstractmethod
   def reduce_sequence(self, inputs, sequence_lengths):
-    """Reduces all input sequences.
-
-    Args:
-      inputs: A list of ``tf.Tensor``.
-      sequence_lengths: The length of each input sequence.
-
-    Returns:
-      A tuple ``(reduced_input, reduced_length)`` with the reduced ``tf.Tensor``
-      and sequence length.
-    """
+    """See :meth:`opennmt.layers.Reducer.__call__`."""
     raise NotImplementedError()
 
 
@@ -144,6 +129,10 @@ class SumReducer(Reducer):
   """A reducer that sums the inputs."""
 
   def reduce(self, inputs):
+    if len(inputs) == 1:
+      return inputs[0]
+    if len(inputs) == 2:
+      return inputs[0] + inputs[1]
     return tf.add_n(inputs)
 
   def reduce_sequence(self, inputs, sequence_lengths):
@@ -155,7 +144,7 @@ class MultiplyReducer(Reducer):
   """A reducer that multiplies the inputs."""
 
   def reduce(self, inputs):
-    return tf.foldl(lambda a, x: a * x, tf.stack(inputs))
+    return functools.reduce(lambda a, x: a * x, inputs)
 
   def reduce_sequence(self, inputs, sequence_lengths):
     padded, combined_length = pad_n_with_identity(inputs, sequence_lengths, identity_values=1)
@@ -165,7 +154,15 @@ class MultiplyReducer(Reducer):
 class ConcatReducer(Reducer):
   """A reducer that concatenates the inputs."""
 
-  def __init__(self, axis=-1):
+  def __init__(self, axis=-1, **kwargs):
+    """Initializes the concat reducer.
+
+    Args:
+      axis: Dimension along which to concatenate. This reducer supports
+        concatenating in depth or in time.
+      **kwargs: Additional layer arguments.
+    """
+    super().__init__(**kwargs)
     self.axis = axis
 
   def reduce(self, inputs):
@@ -195,7 +192,7 @@ class ConcatReducer(Reducer):
           accumulator = elem
           current_length = length
         else:
-          accumulator += roll_sequence(elem, current_length)
+          accumulator += tensor_util.roll_sequence(elem, current_length)
           current_length += length
 
       return accumulator, combined_length
@@ -218,3 +215,23 @@ class JoinReducer(Reducer):
 
   def reduce_sequence(self, inputs, sequence_lengths):
     return self.reduce(inputs), self.reduce(sequence_lengths)
+
+
+class DenseReducer(ConcatReducer):
+  """A reducer that concatenates its inputs in depth and applies a linear transformation."""
+
+  def __init__(self, output_size, activation=None, **kwargs):
+    """Initializes the reducer.
+
+    Args:
+      output_size: The output size of the linear transformation.
+      activation: Activation function (a callable).
+        Set it to ``None`` to maintain a linear activation.
+      **kwargs: Additional layer arguments.
+    """
+    super().__init__(axis=-1, **kwargs)
+    self.dense = tf.keras.layers.Dense(output_size, activation=activation)
+
+  def reduce(self, inputs):
+    inputs = super().reduce(inputs)
+    return self.dense(inputs)

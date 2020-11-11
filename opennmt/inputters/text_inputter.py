@@ -3,74 +3,79 @@
 import abc
 import collections
 import os
-import six
 
 import numpy as np
 import tensorflow as tf
 
-from tensorflow.contrib.tensorboard.plugins import projector
-
+from tensorboard.plugins import projector
 from google.protobuf import text_format
 
-from opennmt.tokenizers.tokenizer import SpaceTokenizer
+from opennmt import constants, tokenizers
+from opennmt.data import dataset as dataset_util
+from opennmt.data import text
+from opennmt.data import vocab
 from opennmt.inputters.inputter import Inputter
-from opennmt.utils.cell import build_cell, last_encoding_from_state
-from opennmt.utils.misc import count_lines
-from opennmt.constants import PADDING_TOKEN
-from opennmt.layers.common import embedding_lookup
+from opennmt.layers import common
+from opennmt.utils import misc
 
 
-def visualize_embeddings(log_dir, embedding_var, vocabulary_file, num_oov_buckets=1):
+def save_embeddings_metadata(log_dir, variable_name, vocabulary_file, num_oov_buckets=1):
   """Registers an embedding variable for visualization in TensorBoard.
 
-  This function registers :obj:`embedding_var` in the ``projector_config.pbtxt``
+  This function registers :obj:`variable_name` in the ``projector_config.pbtxt``
   file and generates metadata from :obj:`vocabulary_file` to attach a label
   to each word ID.
 
   Args:
     log_dir: The active log directory.
-    embedding_var: The embedding variable to visualize.
+    variable_name: The variable name in the checkpoint.
     vocabulary_file: The associated vocabulary file.
     num_oov_buckets: The number of additional unknown tokens.
   """
-  # Copy vocabulary file to log_dir.
-  basename = os.path.basename(vocabulary_file)
-  destination = os.path.join(log_dir, basename)
-  if vocabulary_file != destination:
-    tf.gfile.Copy(vocabulary_file, destination, overwrite=True)
+  # Assume it ends with /.ATTRIBUTES/VALUE
+  filename = "%s.txt" % "_".join(variable_name.split("/")[:-2])
+  metadata_path = os.path.join(log_dir, filename)
 
-    # Append <unk> tokens.
-    with tf.gfile.Open(destination, mode="ab") as vocab:
-      if num_oov_buckets == 1:
-        vocab.write(b"<unk>\n")
+  with tf.io.gfile.GFile(vocabulary_file, mode="rb") as src, \
+       tf.io.gfile.GFile(metadata_path, mode="wb") as dst:
+    ws_index = 0
+    for line in src:
+      # The TensorBoard code checks line.trim().length == 0 when loading the
+      # metadata file so make sure lines are not dropped.
+      if not line.decode("utf-8").replace(u"\uFEFF", u"").strip():
+        dst.write(tf.compat.as_bytes("<whitespace%d>\n" % ws_index))
+        ws_index += 1
       else:
-        for i in range(num_oov_buckets):
-          vocab.write(tf.compat.as_bytes("<unk%d>\n" % i))
+        dst.write(line)
+    if num_oov_buckets == 1:
+      dst.write(b"<unk>\n")
+    else:
+      for i in range(num_oov_buckets):
+        dst.write(tf.compat.as_bytes("<unk%d>\n" % i))
 
   config = projector.ProjectorConfig()
 
   # If the projector file exists, load it.
-  target = os.path.join(log_dir, "projector_config.pbtxt")
-  if tf.gfile.Exists(target):
-    with tf.gfile.Open(target, mode="rb") as target_file:
-      text_format.Merge(target_file.read(), config)
+  config_path = os.path.join(log_dir, "projector_config.pbtxt")
+  if tf.io.gfile.exists(config_path):
+    with tf.io.gfile.GFile(config_path, mode="rb") as config_file:
+      text_format.Merge(config_file.read(), config)
 
   # If this embedding is already registered, just update the metadata path.
   exists = False
   for meta in config.embeddings:
-    if meta.tensor_name == embedding_var.name:
-      meta.metadata_path = basename
+    if meta.tensor_name == variable_name:
+      meta.metadata_path = filename
       exists = True
       break
 
   if not exists:
     embedding = config.embeddings.add()
-    embedding.tensor_name = embedding_var.name
-    embedding.metadata_path = basename
+    embedding.tensor_name = variable_name
+    embedding.metadata_path = filename
 
-  summary_writer = tf.summary.FileWriter(log_dir)
-
-  projector.visualize_embeddings(summary_writer, config)
+  with tf.io.gfile.GFile(config_path, "w") as config_file:
+    config_file.write(text_format.MessageToString(config))
 
 def load_pretrained_embeddings(embedding_file,
                                vocabulary_file,
@@ -123,7 +128,7 @@ def load_pretrained_embeddings(embedding_file,
   """
   # Map words to ids from the vocabulary.
   word_to_id = collections.defaultdict(list)
-  with tf.gfile.Open(vocabulary_file, mode="rb") as vocabulary:
+  with tf.io.gfile.GFile(vocabulary_file, mode="rb") as vocabulary:
     count = 0
     for word in vocabulary:
       word = word.strip()
@@ -133,7 +138,7 @@ def load_pretrained_embeddings(embedding_file,
       count += 1
 
   # Fill pretrained embedding matrix.
-  with tf.gfile.Open(embedding_file, mode="rb") as embedding:
+  with tf.io.gfile.GFile(embedding_file, mode="rb") as embedding:
     pretrained = None
 
     if with_header:
@@ -155,396 +160,363 @@ def load_pretrained_embeddings(embedding_file,
 
   return pretrained
 
-def tokens_to_chars(tokens):
-  """Splits a list of tokens into unicode characters.
-
-  This is an in-graph transformation.
+def add_sequence_controls(ids, length, start_id=None, end_id=None):
+  """Adds sequence control tokens.
 
   Args:
-    tokens: A sequence of tokens.
+    ids: Sequence of ids as 1D or 2D (batch) tensor.
+    length: Sequence length as 0D or 1D (batch) tensor.
+    start_id: Id to prepend to the sequence (set ``None`` to disable).
+    end_id: Id to append to the sequence (set ``None`` to disable).
 
   Returns:
-    The characters as a ``tf.Tensor`` of shape
-    ``[sequence_length, max_word_length]`` and the length of each word.
+    A tuple ``(ids, length)``.
   """
+  rank = ids.shape.rank
+  if rank not in (1, 2):
+    raise ValueError("Unsupported rank %d (expected 1 or 2)" % rank)
+  batch_size = tf.shape(ids)[0] if rank == 2 else None
 
-  def _split_chars(token, max_length, delimiter=" "):
-    chars = list(token.decode("utf-8"))
-    while len(chars) < max_length:
-      chars.append(PADDING_TOKEN)
-    return delimiter.join(chars).encode("utf-8")
+  def _make_column(value):
+    value = tf.constant(value, dtype=ids.dtype)
+    if batch_size is not None:
+      value = tf.fill([batch_size], value)
+    return tf.expand_dims(value, -1)
 
-  def _string_len(token):
-    return len(token.decode("utf-8"))
+  if start_id is not None:
+    start_ids = _make_column(constants.START_OF_SENTENCE_ID)
+    ids = tf.concat([start_ids, ids], axis=-1)
+    length += 1
 
-  def _apply():
-    # Get the length of each token.
-    lengths = tf.map_fn(
-        lambda x: tf.py_func(_string_len, [x], tf.int64),
-        tokens,
-        dtype=tf.int64,
-        back_prop=False)
+  if end_id is not None:
+    end_ids = _make_column(constants.END_OF_SENTENCE_ID)
+    if batch_size is not None:
+      # Run concat on RaggedTensor to handle sequences with variable length.
+      ids = tf.RaggedTensor.from_tensor(ids, lengths=length)
+    ids = tf.concat([ids, end_ids], axis=-1)
+    if batch_size is not None:
+      ids = ids.to_tensor()
+    length += 1
 
-    max_length = tf.reduce_max(lengths)
-
-    # Add a delimiter between each unicode character.
-    spaced_chars = tf.map_fn(
-        lambda x: tf.py_func(_split_chars, [x, max_length], [tf.string]),
-        tokens,
-        dtype=[tf.string],
-        back_prop=False)
-
-    # Split on this delimiter
-    chars = tf.map_fn(
-        lambda x: tf.string_split(x, delimiter=" ").values,
-        spaced_chars,
-        dtype=tf.string,
-        back_prop=False)
-
-    return chars, lengths
-
-  def _none():
-    chars = tf.constant([], dtype=tf.string)
-    lengths = tf.constant([], dtype=tf.int64)
-    return chars, lengths
-
-  chars, lengths = tf.cond(tf.equal(tf.shape(tokens)[0], 0), true_fn=_none, false_fn=_apply)
-  chars.set_shape([None, None])
-  lengths.set_shape([None])
-  return chars, lengths
+  return ids, length
 
 
-@six.add_metaclass(abc.ABCMeta)
 class TextInputter(Inputter):
   """An abstract inputter that processes text."""
 
-  def __init__(self, tokenizer=SpaceTokenizer(), dtype=tf.float32):
-    super(TextInputter, self).__init__(dtype=dtype)
-    self.tokenizer = tokenizer
+  def __init__(self, num_oov_buckets=1, **kwargs):
+    super(TextInputter, self).__init__(**kwargs)
+    self.num_oov_buckets = num_oov_buckets
+    self.noiser = None
+    self.in_place_noise = False
+    self.noise_probability = None
+    self.vocabulary_file = None
+    self.vocabulary_size = None
+    self.tokens_to_ids = None
+    self.ids_to_tokens = None
+    self.tokenizer = None
 
-  def get_length(self, data):
-    return data["length"]
+  def initialize(self, data_config):
+    self.vocabulary_file = data_config["vocabulary"]
+    self.vocabulary_size, self.tokens_to_ids, self.ids_to_tokens = vocab.create_lookup_tables(
+        self.vocabulary_file,
+        self.num_oov_buckets,
+        as_asset=data_config.get("export_vocabulary_assets", True))
+    tokenizer_config = data_config.get("tokenization")
+    self.tokenizer = tokenizers.make_tokenizer(tokenizer_config)
 
-  def make_dataset(self, data_file):
-    return tf.data.TextLineDataset(data_file)
+  def set_noise(self, noiser, in_place=True, probability=None):
+    """Enables noise to be applied to the input features.
+
+    Args:
+      noiser: A :class:`opennmt.data.WordNoiser` instance.
+      in_place: If ``False``, the noisy version of the input will be stored as
+        a separate feature prefixed with ``noisy_``.
+      probability: When :obj:`in_place` is enabled, the probability to apply the
+        noise.
+
+    Raises:
+      ValueError: if :obj:`in_place` is enabled but a :obj:`probability` is not
+        set.
+    """
+    if in_place and probability is None:
+      raise ValueError("In-place noise requires a probability")
+    self.noiser = noiser
+    self.in_place_noise = in_place
+    self.noise_probability = probability
+
+  def export_assets(self, asset_dir):
+    self._assert_is_initialized()
+    return self.tokenizer.export_assets(asset_dir, asset_prefix=self.asset_prefix)
+
+  def make_dataset(self, data_file, training=None):
+    return dataset_util.make_datasets(tf.data.TextLineDataset, data_file)
 
   def get_dataset_size(self, data_file):
-    return count_lines(data_file)
+    if isinstance(data_file, list):
+      return list(map(misc.count_lines, data_file))
+    return misc.count_lines(data_file)
 
-  def initialize(self, metadata):
-    self.tokenizer.initialize(metadata)
-
-  def _process(self, data):
+  def make_features(self, element=None, features=None, training=None):
     """Tokenizes raw text."""
-    data = super(TextInputter, self)._process(data)
-
-    if "tokens" not in data:
-      text = data["raw"]
-      tokens = self.tokenizer.tokenize(text)
+    self._assert_is_initialized()
+    if features is None:
+      features = {}
+    if "tokens" in features:
+      return features
+    if "text" in features:
+      element = features.pop("text")
+    tokens = self.tokenizer.tokenize(element)
+    if isinstance(tokens, tf.RaggedTensor):
+      length = tokens.row_lengths()
+      tokens = tokens.to_tensor()
+    else:
       length = tf.shape(tokens)[0]
+    if training and self.noiser is not None:
+      noisy_tokens, noisy_length = self.noiser(tokens, keep_shape=False)
+      if self.in_place_noise:
+        tokens, length = tf.cond(
+            tf.random.uniform([]) < self.noise_probability,
+            true_fn=lambda: (noisy_tokens, noisy_length),
+            false_fn=lambda: (tokens, length))
+      else:
+        # Call make_features again to fill the remaining noisy features.
+        noisy_features = dict(tokens=noisy_tokens, length=noisy_length)
+        noisy_features = self.make_features(features=noisy_features, training=training)
+        for key, value in noisy_features.items():
+          features["noisy_%s" % key] = value
+    features["length"] = length
+    features["tokens"] = tokens
+    return features
 
-      data = self.set_data_field(data, "tokens", tokens)
-      data = self.set_data_field(data, "length", length)
+  def input_signature(self):
+    self._assert_is_initialized()
+    if self.tokenizer.in_graph:
+      return {
+          "text": tf.TensorSpec([None], tf.string)
+      }
+    else:
+      return {
+          "tokens": tf.TensorSpec([None, None], tf.string),
+          "length": tf.TensorSpec([None], tf.int32)
+      }
 
-    return data
-
-  @abc.abstractmethod
-  def _get_serving_input(self):
-    raise NotImplementedError()
-
-  @abc.abstractmethod
-  def _transform_data(self, data, mode):
-    raise NotImplementedError()
-
-  @abc.abstractmethod
-  def transform(self, inputs, mode):
-    raise NotImplementedError()
+  def _assert_is_initialized(self):
+    if self.tokenizer is None:
+      raise RuntimeError("The input layer is not initialized. You should initialize "
+                         "the model by calling model.initialize(data_config).")
 
 
 class WordEmbedder(TextInputter):
   """Simple word embedder."""
 
-  def __init__(self,
-               vocabulary_file_key,
-               embedding_size=None,
-               embedding_file_key=None,
-               embedding_file_with_header=True,
-               case_insensitive_embeddings=True,
-               trainable=True,
-               dropout=0.0,
-               tokenizer=SpaceTokenizer(),
-               dtype=tf.float32):
+  def __init__(self, embedding_size=None, dropout=0.0, **kwargs):
     """Initializes the parameters of the word embedder.
 
     Args:
-      vocabulary_file_key: The data configuration key of the vocabulary file
-        containing one word per line.
       embedding_size: The size of the resulting embedding.
         If ``None``, an embedding file must be provided.
-      embedding_file_key: The data configuration key of the embedding file.
-      embedding_file_with_header: ``True`` if the embedding file starts with a
-        header line like in GloVe embedding files.
-      case_insensitive_embeddings: ``True`` if embeddings are trained on
-        lowercase data.
-      trainable: If ``False``, do not optimize embeddings.
       dropout: The probability to drop units in the embedding.
-      tokenizer: An optional :class:`opennmt.tokenizers.tokenizer.Tokenizer` to
-        tokenize the input text.
-      dtype: The embedding type.
-
-    Raises:
-      ValueError: if neither :obj:`embedding_size` nor :obj:`embedding_file_key`
-        are set.
-
-    See Also:
-      The :meth:`opennmt.inputters.text_inputter.load_pretrained_embeddings`
-      function for details about the pretrained embedding format and behavior.
+      **kwargs: Additional layer keyword arguments.
     """
-    super(WordEmbedder, self).__init__(tokenizer=tokenizer, dtype=dtype)
-
-    self.vocabulary_file_key = vocabulary_file_key
+    super(WordEmbedder, self).__init__(**kwargs)
     self.embedding_size = embedding_size
-    self.embedding_file_key = embedding_file_key
-    self.embedding_file_with_header = embedding_file_with_header
-    self.case_insensitive_embeddings = case_insensitive_embeddings
-    self.trainable = trainable
+    self.embedding_file = None
     self.dropout = dropout
-    self.num_oov_buckets = 1
+    self.decoder_mode = False
+    self.mark_start = None
+    self.mark_end = None
 
-    if embedding_size is None and embedding_file_key is None:
-      raise ValueError("Must either provide embedding_size or embedding_file_key")
+  def set_decoder_mode(self, enable=True, mark_start=None, mark_end=None):
+    """Make this inputter produce sequences for a decoder.
 
-  def initialize(self, metadata):
-    super(WordEmbedder, self).initialize(metadata)
-    self.vocabulary_file = metadata[self.vocabulary_file_key]
-    self.embedding_file = metadata[self.embedding_file_key] if self.embedding_file_key else None
+    In this mode, the returned "ids_out" feature is the decoder output sequence
+    and "ids" is the decoder input sequence.
 
-    self.vocabulary_size = count_lines(self.vocabulary_file) + self.num_oov_buckets
-    self.vocabulary = tf.contrib.lookup.index_table_from_file(
-        self.vocabulary_file,
-        vocab_size=self.vocabulary_size - self.num_oov_buckets,
-        num_oov_buckets=self.num_oov_buckets)
+    Args:
+      enable: Enable the decoder mode.
+      mark_start: Mark the sequence start. If ``None``, keep the current value.
+      mark_end: Mark the sequence end. If ``None``, keep the current value.
+    """
+    self.decoder_mode = enable
+    if mark_start is not None:
+      self.mark_start = mark_start
+    if mark_end is not None:
+      self.mark_end = mark_end
 
-  def _get_serving_input(self):
-    receiver_tensors = {
-        "tokens": tf.placeholder(tf.string, shape=(None, None)),
-        "length": tf.placeholder(tf.int32, shape=(None,))
-    }
+  def get_length(self, features, ignore_special_tokens=False):
+    length = features["length"]
+    if ignore_special_tokens:
+      # Decoder mode shifts the sequences by one timesteps.
+      num_special_tokens = -1 if self.decoder_mode else 0
+      if self.mark_start:
+        num_special_tokens += 1
+      if self.mark_end:
+        num_special_tokens += 1
+      length -= num_special_tokens
+    return length
 
-    features = receiver_tensors.copy()
-    features["ids"] = self.vocabulary.lookup(features["tokens"])
+  def initialize(self, data_config):
+    super(WordEmbedder, self).initialize(data_config)
+    embedding = data_config.get("embedding")
+    if embedding is None and self.embedding_size is None:
+      raise ValueError("embedding_size must be set")
+    if embedding is not None:
+      self.embedding_file = embedding["path"]
+      self.trainable = embedding.get("trainable", True)
+      self.embedding_file_with_header = embedding.get("with_header", True)
+      self.case_insensitive_embeddings = embedding.get("case_insensitive", True)
+    sequence_controls = data_config.get("sequence_controls")
+    if sequence_controls:
+      self.mark_start = sequence_controls["start"]
+      self.mark_end = sequence_controls["end"]
 
-    return receiver_tensors, features
-
-  def _process(self, data):
+  def make_features(self, element=None, features=None, training=None):
     """Converts words tokens to ids."""
-    data = super(WordEmbedder, self)._process(data)
+    features = super(WordEmbedder, self).make_features(
+        element=element, features=features, training=training)
+    if "ids" not in features:
+      features["ids"] = self.tokens_to_ids.lookup(features["tokens"])
+      if self.mark_start or self.mark_end:
+        features["ids"], features["length"] = add_sequence_controls(
+            features["ids"],
+            features["length"],
+            start_id=constants.START_OF_SENTENCE_ID if self.mark_start else None,
+            end_id=constants.END_OF_SENTENCE_ID if self.mark_end else None)
+    if self.decoder_mode:
+      features["ids_out"] = features["ids"][1:]
+      features["ids"] = features["ids"][:-1]
+      features["length"] -= 1
+    return features
 
-    if "ids" not in data:
-      tokens = data["tokens"]
-      ids = self.vocabulary.lookup(tokens)
-
-      data = self.set_data_field(data, "ids", ids)
-
-    return data
-
-  def visualize(self, log_dir):
-    with tf.variable_scope(tf.get_variable_scope(), reuse=True):
-      embeddings = tf.get_variable("w_embs", dtype=self.dtype)
-      visualize_embeddings(
-          log_dir,
-          embeddings,
+  def build(self, input_shape):
+    if self.embedding_file:
+      pretrained = load_pretrained_embeddings(
+          self.embedding_file,
           self.vocabulary_file,
-          num_oov_buckets=self.num_oov_buckets)
+          num_oov_buckets=self.num_oov_buckets,
+          with_header=self.embedding_file_with_header,
+          case_insensitive_embeddings=self.case_insensitive_embeddings)
+      self.embedding_size = pretrained.shape[-1]
+      initializer = tf.constant_initializer(value=pretrained.astype(self.dtype))
+    else:
+      initializer = None
+    self.embedding = self.add_weight(
+        "embedding",
+        [self.vocabulary_size, self.embedding_size],
+        initializer=initializer,
+        trainable=self.trainable)
+    super(WordEmbedder, self).build(input_shape)
 
-  def _transform_data(self, data, mode):
-    return self.transform(data["ids"], mode)
-
-  def transform(self, inputs, mode):
-    try:
-      embeddings = tf.get_variable("w_embs", dtype=self.dtype, trainable=self.trainable)
-    except ValueError:
-      # Variable does not exist yet.
-      if self.embedding_file:
-        pretrained = load_pretrained_embeddings(
-            self.embedding_file,
-            self.vocabulary_file,
-            num_oov_buckets=self.num_oov_buckets,
-            with_header=self.embedding_file_with_header,
-            case_insensitive_embeddings=self.case_insensitive_embeddings)
-        self.embedding_size = pretrained.shape[-1]
-
-        initializer = tf.constant_initializer(
-            pretrained.astype(self.dtype.as_numpy_dtype()), dtype=self.dtype)
-      else:
-        initializer = None
-
-      shape = [self.vocabulary_size, self.embedding_size]
-      embeddings = tf.get_variable(
-          "w_embs",
-          shape=shape,
-          dtype=self.dtype,
-          initializer=initializer,
-          trainable=self.trainable)
-
-    outputs = embedding_lookup(embeddings, inputs)
-
-    outputs = tf.layers.dropout(
-        outputs,
-        rate=self.dropout,
-        training=mode == tf.estimator.ModeKeys.TRAIN)
-
+  def call(self, features, training=None):
+    outputs = tf.nn.embedding_lookup(self.embedding, features["ids"])
+    outputs = common.dropout(outputs, self.dropout, training=training)
     return outputs
 
+  def visualize(self, model_root, log_dir):
+    save_embeddings_metadata(
+        log_dir,
+        misc.get_variable_name(self.embedding, model_root),
+        self.vocabulary_file,
+        num_oov_buckets=self.num_oov_buckets)
 
-@six.add_metaclass(abc.ABCMeta)
+  def map_v1_weights(self, weights):
+    return [(self.embedding, weights["w_embs"])]
+
+
 class CharEmbedder(TextInputter):
   """Base class for character-aware inputters."""
 
-  def __init__(self,
-               vocabulary_file_key,
-               embedding_size,
-               dropout=0.0,
-               tokenizer=SpaceTokenizer(),
-               dtype=tf.float32):
+  def __init__(self, embedding_size, dropout=0.0, **kwargs):
     """Initializes the parameters of the character embedder.
 
     Args:
-      vocabulary_file_key: The meta configuration key of the vocabulary file
-        containing one character per line.
       embedding_size: The size of the character embedding.
       dropout: The probability to drop units in the embedding.
-      tokenizer: An optional :class:`opennmt.tokenizers.tokenizer.Tokenizer` to
-        tokenize the input text.
-      dtype: The embedding type.
+      **kwargs: Additional layer keyword arguments.
     """
-    super(CharEmbedder, self).__init__(tokenizer=tokenizer, dtype=dtype)
-
-    self.vocabulary_file_key = vocabulary_file_key
+    super(CharEmbedder, self).__init__(**kwargs)
     self.embedding_size = embedding_size
+    self.embedding = None
     self.dropout = dropout
-    self.num_oov_buckets = 1
 
-  def initialize(self, metadata):
-    super(CharEmbedder, self).initialize(metadata)
-    self.vocabulary_file = metadata[self.vocabulary_file_key]
-    self.vocabulary_size = count_lines(self.vocabulary_file) + self.num_oov_buckets
-    self.vocabulary = tf.contrib.lookup.index_table_from_file(
-        self.vocabulary_file,
-        vocab_size=self.vocabulary_size - self.num_oov_buckets,
-        num_oov_buckets=self.num_oov_buckets)
-
-  def _get_serving_input(self):
-    receiver_tensors = {
-        "chars": tf.placeholder(tf.string, shape=(None, None, None)),
-        "length": tf.placeholder(tf.int32, shape=(None,))
-    }
-
-    features = receiver_tensors.copy()
-    features["char_ids"] = self.vocabulary.lookup(features["chars"])
-
-    return receiver_tensors, features
-
-  def _process(self, data):
+  def make_features(self, element=None, features=None, training=None):
     """Converts words to characters."""
-    data = super(CharEmbedder, self)._process(data)
+    if features is None:
+      features = {}
+    if "char_ids" in features:
+      return features
+    if "chars" in features:
+      chars = features["chars"]
+    else:
+      features = super(CharEmbedder, self).make_features(
+          element=element, features=features, training=training)
+      chars = text.tokens_to_chars(features["tokens"])
+      chars = chars.to_tensor(default_value=constants.PADDING_TOKEN)
+    features["char_ids"] = self.tokens_to_ids.lookup(chars)
+    return features
 
-    if "char_ids" not in data:
-      tokens = data["tokens"]
-      chars, _ = tokens_to_chars(tokens)
-      ids = self.vocabulary.lookup(chars)
-
-      data = self.set_data_field(data, "char_ids", ids)
-
-    return data
-
-  def visualize(self, log_dir):
-    with tf.variable_scope(tf.get_variable_scope(), reuse=True):
-      embeddings = tf.get_variable("w_char_embs", dtype=self.dtype)
-      visualize_embeddings(
-          log_dir,
-          embeddings,
-          self.vocabulary_file,
-          num_oov_buckets=self.num_oov_buckets)
-
-  def _transform_data(self, data, mode):
-    return self.transform(data["char_ids"], mode)
-
-  def _embed(self, inputs, mode):
-    embeddings = tf.get_variable(
-        "w_char_embs", shape=[self.vocabulary_size, self.embedding_size], dtype=self.dtype)
-
-    outputs = embedding_lookup(embeddings, inputs)
-    outputs = tf.layers.dropout(
-        outputs,
-        rate=self.dropout,
-        training=mode == tf.estimator.ModeKeys.TRAIN)
-    return outputs
+  def build(self, input_shape):
+    self.embedding = self.add_weight(
+        "char_embedding", [self.vocabulary_size, self.embedding_size])
+    super(CharEmbedder, self).build(input_shape)
 
   @abc.abstractmethod
-  def transform(self, inputs, mode):
+  def call(self, features, training=None):
     raise NotImplementedError()
+
+  def visualize(self, model_root, log_dir):
+    save_embeddings_metadata(
+        log_dir,
+        misc.get_variable_name(self.embedding, model_root),
+        self.vocabulary_file,
+        num_oov_buckets=self.num_oov_buckets)
+
+  def _embed(self, inputs, training):
+    mask = tf.math.not_equal(inputs, 0)
+    outputs = tf.nn.embedding_lookup(self.embedding, inputs)
+    outputs = common.dropout(outputs, self.dropout, training=training)
+    return outputs, mask
 
 
 class CharConvEmbedder(CharEmbedder):
   """An inputter that applies a convolution on characters embeddings."""
 
   def __init__(self,
-               vocabulary_file_key,
                embedding_size,
                num_outputs,
                kernel_size=5,
                stride=3,
                dropout=0.0,
-               tokenizer=SpaceTokenizer(),
-               dtype=tf.float32):
+               **kwargs):
     """Initializes the parameters of the character convolution embedder.
 
     Args:
-      vocabulary_file_key: The meta configuration key of the vocabulary file
-        containing one character per line.
       embedding_size: The size of the character embedding.
       num_outputs: The dimension of the convolution output space.
       kernel_size: Length of the convolution window.
       stride: Length of the convolution stride.
       dropout: The probability to drop units in the embedding.
-      tokenizer: An optional :class:`opennmt.tokenizers.tokenizer.Tokenizer` to
-        tokenize the input text.
-      dtype: The embedding type.
+      **kwargs: Additional layer keyword arguments.
     """
     super(CharConvEmbedder, self).__init__(
-        vocabulary_file_key,
         embedding_size,
         dropout=dropout,
-        tokenizer=tokenizer,
-        dtype=dtype)
-    self.num_outputs = num_outputs
-    self.kernel_size = kernel_size
-    self.stride = stride
-    self.num_oov_buckets = 1
+        **kwargs)
+    self.output_size = num_outputs
+    self.conv = tf.keras.layers.Conv1D(
+        num_outputs,
+        kernel_size,
+        strides=stride,
+        padding="same")
 
-  def transform(self, inputs, mode):
-    outputs = self._embed(inputs, mode)
-
-    # Merge batch and sequence timesteps dimensions.
-    outputs = tf.reshape(outputs, [-1, tf.shape(inputs)[-1], self.embedding_size])
-
-    # Pad on both sides.
-    outputs = tf.pad(outputs, [[0, 0], [self.kernel_size - 1, self.kernel_size - 1], [0, 0]])
-    outputs.set_shape((None, None, self.embedding_size))
-
-    outputs = tf.layers.conv1d(
-        outputs,
-        self.num_outputs,
-        self.kernel_size,
-        strides=self.stride)
-
-    # Max pooling over depth.
+  def call(self, features, training=None):
+    inputs = features["char_ids"]
+    flat_inputs = tf.reshape(inputs, [-1, tf.shape(inputs)[-1]])
+    outputs, _ = self._embed(flat_inputs, training)
+    outputs = self.conv(outputs)
     outputs = tf.reduce_max(outputs, axis=1)
-
-    # Split batch and sequence timesteps dimensions.
-    outputs = tf.reshape(outputs, [-1, tf.shape(inputs)[1], self.num_outputs])
-
+    outputs = tf.reshape(outputs, [-1, tf.shape(inputs)[1], self.output_size])
     return outputs
 
 
@@ -552,67 +524,38 @@ class CharRNNEmbedder(CharEmbedder):
   """An inputter that runs a single RNN layer over character embeddings."""
 
   def __init__(self,
-               vocabulary_file_key,
                embedding_size,
                num_units,
                dropout=0.2,
-               encoding="average",
-               cell_class=tf.contrib.rnn.LSTMCell,
-               tokenizer=SpaceTokenizer(),
-               dtype=tf.float32):
+               cell_class=None,
+               **kwargs):
     """Initializes the parameters of the character RNN embedder.
 
     Args:
-      vocabulary_file_key: The meta configuration key of the vocabulary file
-        containing one character per line.
       embedding_size: The size of the character embedding.
       num_units: The number of units in the RNN layer.
       dropout: The probability to drop units in the embedding and the RNN
         outputs.
-      encoding: "average" or "last" (case insensitive), the encoding vector to
-        extract from the RNN outputs.
       cell_class: The inner cell class or a callable taking :obj:`num_units` as
-        argument and returning a cell.
-      tokenizer: An optional :class:`opennmt.tokenizers.tokenizer.Tokenizer` to
-        tokenize the input text.
-      dtype: The embedding type.
+        argument and returning a cell. Defaults to a LSTM cell.
+      **kwargs: Additional layer keyword arguments.
 
     Raises:
       ValueError: if :obj:`encoding` is invalid.
     """
     super(CharRNNEmbedder, self).__init__(
-        vocabulary_file_key,
         embedding_size,
         dropout=dropout,
-        tokenizer=tokenizer,
-        dtype=dtype)
+        **kwargs)
+    if cell_class is None:
+      cell_class = tf.keras.layers.LSTMCell
+    self.rnn = tf.keras.layers.RNN(cell_class(num_units))
     self.num_units = num_units
-    self.cell_class = cell_class
-    self.encoding = encoding.lower()
-    if self.encoding not in ("average", "last"):
-      raise ValueError("Invalid encoding vector: {}".format(self.encoding))
 
-  def transform(self, inputs, mode):
+  def call(self, features, training=None):
+    inputs = features["char_ids"]
     flat_inputs = tf.reshape(inputs, [-1, tf.shape(inputs)[-1]])
-    embeddings = self._embed(flat_inputs, mode)
-    sequence_length = tf.count_nonzero(flat_inputs, axis=1)
-
-    cell = build_cell(
-        1,
-        self.num_units,
-        mode,
-        dropout=self.dropout,
-        cell_class=self.cell_class)
-    rnn_outputs, rnn_state = tf.nn.dynamic_rnn(
-        cell,
-        embeddings,
-        sequence_length=sequence_length,
-        dtype=embeddings.dtype)
-
-    if self.encoding == "average":
-      encoding = tf.reduce_mean(rnn_outputs, axis=1)
-    elif self.encoding == "last":
-      encoding = last_encoding_from_state(rnn_state)
-
-    outputs = tf.reshape(encoding, [-1, tf.shape(inputs)[1], self.num_units])
+    embeddings, mask = self._embed(flat_inputs, training)
+    outputs = self.rnn(embeddings, mask=mask, training=training)
+    outputs = tf.reshape(outputs, [-1, tf.shape(inputs)[1], self.num_units])
     return outputs

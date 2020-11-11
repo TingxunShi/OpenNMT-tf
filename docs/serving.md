@@ -1,11 +1,13 @@
 # Serving
 
-## Exporting SavedModel
+## TensorFlow
 
-OpenNMT-tf periodically exports models for inference in other environments, for example with [TensorFlow Serving](https://www.tensorflow.org/serving/). A model export contains all information required for inference: the graph definition, the weights, and external assets such as vocabulary files. It typically looks like this on disk:
+### Exporting a SavedModel
+
+OpenNMT-tf can export [SavedModel](https://www.tensorflow.org/guide/saved_model) packages for inference in other environments, for example with [TensorFlow Serving](https://www.tensorflow.org/serving/). A model export contains all information required for inference: the graph definition, the weights, and external assets such as vocabulary files. It typically looks like this on disk:
 
 ```text
-toy-ende/export/latest/1507109306/
+toy-ende/export/
 ├── assets
 │   ├── src-vocab.txt
 │   └── tgt-vocab.txt
@@ -15,28 +17,37 @@ toy-ende/export/latest/1507109306/
     └── variables.index
 ```
 
-In the `train_and_eval` run type, models can be automatically exported following one or several export schedules:
-
-* `last`: a model is exported to `export/latest` after each evaluation (default);
-* `final`: a model is exported to `export/final` at the end of the training;
-* `best`: a model is exported to `export/best` only if it achieves the best evaluation loss so far.
-
-Export schedules are set by the `exporters` field in the `eval` section of the configuration file.
-
-Additionally, models can be manually exported using the `export` run type. Manually exported models are located by default in `export/manual/` within the model directory; a custom destination can be configured with the command line option `--export_dir_base`.
-
-## Running SavedModel
-
-When using an exported model, you need to know the input and output nodes of your model. You can use the [`saved_model_cli`](https://www.tensorflow.org/programmers_guide/saved_model#cli_to_inspect_and_execute_savedmodel) script provided by TensorFlow for inspection, e.g.:
+Models can be manually exported using the `export` run type:
 
 ```bash
-saved_model_cli show --dir toy-ende/export/latest/1507109306/ \
+onmt-main --config my_config.yml --auto_config export --export_dir ~/my-models/ende
+```
+
+Automatic evaluation during the training can also export models, see [Training](training.md) to learn more.
+
+### Running a SavedModel
+
+Once a SavedModel is exported, OpenNMT-tf is no longer needed to run it. However, you will need to know the input and output nodes of your model. You can use the [`saved_model_cli`](https://www.tensorflow.org/programmers_guide/saved_model#cli_to_inspect_and_execute_savedmodel) script provided by TensorFlow for inspection, e.g.:
+
+```bash
+saved_model_cli show --dir ~/my-models/ende \
     --tag_set serve --signature_def serving_default
 ```
 
-Some examples using exported models are available in the `examples/` directory:
+Some examples using exported models are available in the [`examples/serving`](https://github.com/OpenNMT/OpenNMT-tf/tree/master/examples/serving) directory.
 
-* `examples/serving` to serve a model with TensorFlow Serving
-* `examples/cpp` to run inference with the TensorFlow C++ API
+### Input preprocessing and tokenization
 
-**Note:** because the Python function used in `tf.py_func` is not serialized in the graph, model exports do not support in-graph tokenization and text inputs are expected to be tokenized.
+TensorFlow Serving only runs TensorFlow operations. Preprocessing functions such as the tokenization is sometimes not implemented in terms of TensorFlow ops (see [Tokenization](tokenization.md) for more details). In this case, these functions should be run outside of the TensorFlow runtime, either by the client or a proxy server.
+
+## CTranslate2
+
+[CTranslate2](https://github.com/OpenNMT/CTranslate2) is an optimized inference engine for OpenNMT models that is typically faster, lighter, and more customizable than the TensorFlow runtime.
+
+Selected models can be exported to the CTranslate2 format directly from OpenNMT-tf. An additional `export_format` option should be configured to select this export type:
+
+```bash
+onmt-main [...] export --export_dir ~/my-models/ende --export_format ctranslate2
+```
+
+The same option is available in the `eval` block of the YAML configuration when exporting models during the training.

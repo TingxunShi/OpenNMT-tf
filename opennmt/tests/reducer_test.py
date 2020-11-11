@@ -2,6 +2,7 @@ import collections
 
 import tensorflow as tf
 
+from parameterized import parameterized
 from opennmt.layers import reducer
 
 
@@ -13,9 +14,8 @@ class ReducerTest(tf.test.TestCase):
         [[1], [2], [3]]]
     length = 3
     b = reducer.align_in_time(tf.constant(a, dtype=tf.float32), tf.constant(length))
-    self.assertEqual(1, b.get_shape().as_list()[-1])
-    with self.test_session() as sess:
-      self.assertAllEqual(a, sess.run(b))
+    self.assertEqual(1, b.shape[-1])
+    self.assertAllEqual(a, self.evaluate(b))
 
   def testAlignInTimeLarger(self):
     a = [
@@ -26,9 +26,8 @@ class ReducerTest(tf.test.TestCase):
         [[1], [0], [0], [0]],
         [[1], [2], [3], [0]]]
     c = reducer.align_in_time(tf.constant(a, dtype=tf.float32), tf.constant(length))
-    self.assertEqual(1, c.get_shape().as_list()[-1])
-    with self.test_session() as sess:
-      self.assertAllEqual(b, sess.run(c))
+    self.assertEqual(1, c.shape[-1])
+    self.assertAllEqual(b, self.evaluate(c))
 
   def testAlignInTimeSmaller(self):
     a = [
@@ -39,9 +38,8 @@ class ReducerTest(tf.test.TestCase):
         [[1], [0]],
         [[1], [2]]]
     c = reducer.align_in_time(tf.constant(a, dtype=tf.float32), tf.constant(length))
-    self.assertEqual(1, c.get_shape().as_list()[-1])
-    with self.test_session() as sess:
-      self.assertAllEqual(b, sess.run(c))
+    self.assertEqual(1, c.shape[-1])
+    self.assertAllEqual(b, self.evaluate(c))
 
   def testPadWithIdentity(self):
     tensor = [
@@ -61,11 +59,8 @@ class ReducerTest(tf.test.TestCase):
         tf.constant(max_lengths),
         identity_values=1)
 
-    self.assertEqual(1, padded.get_shape().as_list()[-1])
-
-    with self.test_session() as sess:
-      padded = sess.run(padded)
-      self.assertAllEqual(expected, padded)
+    self.assertEqual(1, padded.shape[-1])
+    self.assertAllEqual(expected, self.evaluate(padded))
 
   def testPadWithIdentityWithMaxTime(self):
     tensor = [
@@ -87,11 +82,8 @@ class ReducerTest(tf.test.TestCase):
         identity_values=1,
         maxlen=maxlen)
 
-    self.assertEqual(1, padded.get_shape().as_list()[-1])
-
-    with self.test_session() as sess:
-      padded = sess.run(padded)
-      self.assertAllEqual(expected, padded)
+    self.assertEqual(1, padded.shape[-1])
+    self.assertAllEqual(expected, self.evaluate(padded))
 
   def testPadNWithIdentity(self):
     a = [
@@ -118,11 +110,10 @@ class ReducerTest(tf.test.TestCase):
         [tf.constant(length_a), tf.constant(length_b)],
         identity_values=1)
 
-    with self.test_session() as sess:
-      padded_a, padded_b, length = sess.run([padded_a, padded_b, length])
-      self.assertAllEqual([4, 3, 2], length)
-      self.assertAllEqual(expected_a, padded_a)
-      self.assertAllEqual(expected_b, padded_b)
+    padded_a, padded_b, length = self.evaluate([padded_a, padded_b, length])
+    self.assertAllEqual([4, 3, 2], length)
+    self.assertAllEqual(expected_a, padded_a)
+    self.assertAllEqual(expected_b, padded_b)
 
   def testPadNWithIdentityWithMaxTime(self):
     a = [
@@ -149,27 +140,10 @@ class ReducerTest(tf.test.TestCase):
         [tf.constant(length_a), tf.constant(length_b)],
         identity_values=1)
 
-    with self.test_session() as sess:
-      padded_a, padded_b, length = sess.run([padded_a, padded_b, length])
-      self.assertAllEqual([4, 3, 2], length)
-      self.assertAllEqual(expected_a, padded_a)
-      self.assertAllEqual(expected_b, padded_b)
-
-  def testRollSequence(self):
-    offset = [2, 3, 3]
-    tensor = [
-        [1, 2, 3, 0, 0, 6, 0],
-        [1, 2, 3, 4, 0, 0, 0],
-        [1, 0, 0, 0, 0, 0, 7]]
-    expected = [
-        [6, 0, 1, 2, 3, 0, 0],
-        [0, 0, 0, 1, 2, 3, 4],
-        [0, 0, 7, 1, 0, 0, 0]]
-
-    rolled = reducer.roll_sequence(tensor, offset)
-
-    with self.test_session() as sess:
-      self.assertAllEqual(expected, sess.run(rolled))
+    padded_a, padded_b, length = self.evaluate([padded_a, padded_b, length])
+    self.assertAllEqual([4, 3, 2], length)
+    self.assertAllEqual(expected_a, padded_a)
+    self.assertAllEqual(expected_b, padded_b)
 
   def testMultiplyReducerWithSequence(self):
     a = [
@@ -187,14 +161,13 @@ class ReducerTest(tf.test.TestCase):
     length_a = [1, 3, 2]
     length_b = [4, 2, 2]
 
-    reduced, length = reducer.MultiplyReducer().reduce_sequence(
+    reduced, length = reducer.MultiplyReducer()(
         [tf.constant(a, dtype=tf.float32), tf.constant(b, dtype=tf.float32)],
         [tf.constant(length_a), tf.constant(length_b)])
 
-    with self.test_session() as sess:
-      reduced, length = sess.run([reduced, length])
-      self.assertAllEqual(expected, reduced)
-      self.assertAllEqual([4, 3, 2], length)
+    reduced, length = self.evaluate([reduced, length])
+    self.assertAllEqual(expected, reduced)
+    self.assertAllEqual([4, 3, 2], length)
 
   def testMultiplyReducerWithSequenceAndMaxTime(self):
     a = [
@@ -212,14 +185,13 @@ class ReducerTest(tf.test.TestCase):
     length_a = [1, 3, 2]
     length_b = [4, 2, 2]
 
-    reduced, length = reducer.MultiplyReducer().reduce_sequence(
+    reduced, length = reducer.MultiplyReducer()(
         [tf.constant(a, dtype=tf.float32), tf.constant(b, dtype=tf.float32)],
         [tf.constant(length_a), tf.constant(length_b)])
 
-    with self.test_session() as sess:
-      reduced, length = sess.run([reduced, length])
-      self.assertAllEqual(expected, reduced)
-      self.assertAllEqual([4, 3, 2], length)
+    reduced, length = self.evaluate([reduced, length])
+    self.assertAllEqual(expected, reduced)
+    self.assertAllEqual([4, 3, 2], length)
 
   def testConcatInDepthWithSequence(self):
     a = [
@@ -237,16 +209,14 @@ class ReducerTest(tf.test.TestCase):
     length_a = [1, 3, 2]
     length_b = [4, 2, 2]
 
-    reduced, length = reducer.ConcatReducer().reduce_sequence(
+    reduced, length = reducer.ConcatReducer()(
         [tf.constant(a, dtype=tf.float32), tf.constant(b, dtype=tf.float32)],
         [tf.constant(length_a), tf.constant(length_b)])
 
-    self.assertEqual(2, reduced.get_shape().as_list()[-1])
-
-    with self.test_session() as sess:
-      reduced, length = sess.run([reduced, length])
-      self.assertAllEqual(expected, reduced)
-      self.assertAllEqual([4, 3, 2], length)
+    self.assertEqual(2, reduced.shape[-1])
+    reduced, length = self.evaluate([reduced, length])
+    self.assertAllEqual(expected, reduced)
+    self.assertAllEqual([4, 3, 2], length)
 
   def testConcatInTimeWithSequence(self):
     a = [
@@ -264,16 +234,14 @@ class ReducerTest(tf.test.TestCase):
     length_a = [1, 3, 2]
     length_b = [4, 2, 2]
 
-    reduced, length = reducer.ConcatReducer(axis=1).reduce_sequence(
+    reduced, length = reducer.ConcatReducer(axis=1)(
         [tf.constant(a, dtype=tf.float32), tf.constant(b, dtype=tf.float32)],
         [tf.constant(length_a), tf.constant(length_b)])
 
-    self.assertEqual(1, reduced.get_shape().as_list()[-1])
-
-    with self.test_session() as sess:
-      reduced, length = sess.run([reduced, length])
-      self.assertAllEqual(expected, reduced)
-      self.assertAllEqual([5, 5, 4], length)
+    self.assertEqual(1, reduced.shape[-1])
+    reduced, length = self.evaluate([reduced, length])
+    self.assertAllEqual(expected, reduced)
+    self.assertAllEqual([5, 5, 4], length)
 
   def testConcatInTimeWithSequenceAndMaxTimeMismatch(self):
     a = [
@@ -291,27 +259,48 @@ class ReducerTest(tf.test.TestCase):
     length_a = [1, 3, 2]
     length_b = [4, 2, 2]
 
-    reduced, length = reducer.ConcatReducer(axis=1).reduce_sequence(
+    reduced, length = reducer.ConcatReducer(axis=1)(
         [tf.constant(a, dtype=tf.float32), tf.constant(b, dtype=tf.float32)],
         [tf.constant(length_a), tf.constant(length_b)])
 
-    self.assertEqual(1, reduced.get_shape().as_list()[-1])
-
-    with self.test_session() as sess:
-      reduced, length = sess.run([reduced, length])
-      self.assertAllEqual(expected, reduced)
-      self.assertAllEqual([5, 5, 4], length)
+    self.assertEqual(1, reduced.shape[-1])
+    reduced, length = self.evaluate([reduced, length])
+    self.assertAllEqual(expected, reduced)
+    self.assertAllEqual([5, 5, 4], length)
 
   def testJoinReducer(self):
-    self.assertTupleEqual((1, 2, 3), reducer.JoinReducer().reduce([1, 2, 3]))
-    self.assertTupleEqual((1, 2, 3), reducer.JoinReducer().reduce([(1,), (2,), (3,)]))
-    self.assertTupleEqual((1, 2, 3), reducer.JoinReducer().reduce([1, (2, 3)]))
+    self.assertTupleEqual((1, 2, 3), reducer.JoinReducer()([1, 2, 3]))
+    self.assertTupleEqual((1, 2, 3), reducer.JoinReducer()([(1,), (2,), (3,)]))
+    self.assertTupleEqual((1, 2, 3), reducer.JoinReducer()([1, (2, 3)]))
 
     # Named tuples should not be unpacked.
     State = collections.namedtuple("State", ["h", "c"])
     self.assertTupleEqual((State(h=1, c=2), State(h=3, c=4), State(h=5, c=6)),
-                          reducer.JoinReducer().reduce([
+                          reducer.JoinReducer()([
                               State(h=1, c=2), (State(h=3, c=4), State(h=5, c=6))]))
+
+  @parameterized.expand([
+      [reducer.SumReducer(), [1, 2, 3], [4, 5, 6], [5, 7, 9]],
+      [reducer.SumReducer(), (1, 2, 3), (4, 5, 6), (5, 7, 9)],
+      [reducer.SumReducer(), 1, 2, 3]
+  ])
+  def testZipAndReduce(self, reducer, x, y, expected_z):
+    z = reducer.zip_and_reduce(x, y)
+    z = self.evaluate(z)
+    self.assertAllEqual(z, expected_z)
+
+  def testDenseReducer(self):
+    inputs = [
+        tf.random.uniform([3, 4]),
+        tf.random.uniform([3, 12]),
+        tf.random.uniform([3, 6]),
+    ]
+    dense_reducer = reducer.DenseReducer(10, activation=tf.nn.relu)
+    output = dense_reducer(inputs)
+    self.assertTrue(dense_reducer.built)
+    self.assertNotEmpty(dense_reducer.variables)
+    self.assertListEqual(output.shape.as_list(), [3, 10])
+    self.assertAllGreaterEqual(output, 0)
 
 
 if __name__ == "__main__":

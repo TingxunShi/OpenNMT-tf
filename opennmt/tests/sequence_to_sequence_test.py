@@ -1,6 +1,10 @@
+import os
+
 import tensorflow as tf
 
+from opennmt.inputters import text_inputter
 from opennmt.models import sequence_to_sequence
+from opennmt.tests import test_util
 
 
 class SequenceToSequenceTest(tf.test.TestCase):
@@ -30,30 +34,36 @@ class SequenceToSequenceTest(tf.test.TestCase):
         source_tokens,
         attention,
         unknown_token="<unk>")
-    with self.test_session() as sess:
-      replaced_target_tokens = sess.run(replaced_target_tokens)
-      self.assertNotIn(b"<unk>", replaced_target_tokens.flatten().tolist())
-      self.assertListEqual(
-          [b"Hello", b"world", b"!", b"", b"", b""], replaced_target_tokens[0].tolist())
-      self.assertListEqual(
-          [b"Mon", b"name", b"is", b"Max", b".", b""], replaced_target_tokens[1].tolist())
+    replaced_target_tokens = self.evaluate(replaced_target_tokens)
+    self.assertNotIn(b"<unk>", replaced_target_tokens.flatten().tolist())
+    self.assertListEqual(
+        [b"Hello", b"world", b"!", b"", b"", b""], replaced_target_tokens[0].tolist())
+    self.assertListEqual(
+        [b"Mon", b"name", b"is", b"Max", b".", b""], replaced_target_tokens[1].tolist())
 
-  def _testPharaohAlignments(self, line, lengths, expected_matrix):
-    matrix = sequence_to_sequence.alignment_matrix_from_pharaoh(
-        tf.constant(line), lengths[0], lengths[1], dtype=tf.int32)
-    with self.test_session() as sess:
-      self.assertListEqual(expected_matrix, sess.run(matrix).tolist())
-
-  def testPharaohAlignments(self):
-    self._testPharaohAlignments("0-0", [1, 1], [[1]])
-    self._testPharaohAlignments(
-        "0-0 1-1 2-2 3-3", [4, 4], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    self._testPharaohAlignments(
-        "0-0 1-1 2-3 3-2", [4, 4], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]])
-    self._testPharaohAlignments(
-        "0-0 1-2 1-1", [2, 3], [[1, 0], [0, 1], [0, 1]])
-    self._testPharaohAlignments(
-        "0-0 1-2 1-1 2-4", [3, 5], [[1, 0, 0], [0, 1, 0], [0, 1, 0], [0, 0, 0], [0, 0, 1]])
+  def testSequenceToSequenceInputter(self):
+    source_vocabulary = test_util.make_data_file(
+        os.path.join(self.get_temp_dir(), "src_vocab.txt"),
+        ["<blank>", "<s>", "</s>", "a", "b", "c", "d"])
+    target_vocabulary = test_util.make_data_file(
+        os.path.join(self.get_temp_dir(), "tgt_vocab.txt"),
+        ["<blank>", "<s>", "</s>", "e", "f", "g", "h"])
+    source_file = test_util.make_data_file(
+        os.path.join(self.get_temp_dir(), "src.txt"), ["a c c", "b d", "a e"])
+    target_file = test_util.make_data_file(
+        os.path.join(self.get_temp_dir(), "tgt.txt"), ["f h g", "e h", "a e"])
+    inputter = sequence_to_sequence.SequenceToSequenceInputter(
+        text_inputter.WordEmbedder(embedding_size=20),
+        text_inputter.WordEmbedder(embedding_size=20))
+    inputter.initialize(dict(
+        source_vocabulary=source_vocabulary, target_vocabulary=target_vocabulary))
+    dataset = inputter.make_dataset([source_file, target_file])
+    element = iter(dataset).next()
+    features, labels = inputter.make_features(element)
+    self.assertIn("ids_out", labels)
+    self.assertAllEqual(labels["ids"], [1, 4, 6, 5])
+    self.assertAllEqual(labels["ids_out"], [4, 6, 5, 2])
+    self.assertEqual(labels["length"], 4)
 
 
 if __name__ == "__main__":

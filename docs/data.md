@@ -1,15 +1,33 @@
 # Data
 
-## Data format
+Data files are configured in the `data` block of the YAML configuration file (see [Parameters](configuration.md)). For example, here is a typical data configuration for a sequence to sequence model:
 
-The format of the data files is defined by the `opennmt.inputters.Inputter` used by your model.
+```yaml
+data:
+  train_features_file: /data/ende/train.en
+  train_labels_file: /data/ende/train.de
+  eval_features_file: /data/ende/valid.en  # optional
+  eval_labels_file: /data/ende/valid.de    # optional
+```
+
+This page documents how to prepare and configure data files for OpenNMT-tf.
+
+## Terminology
+
+* *features*: the model inputs (a.k.a. the *source*)
+* *labels*: the model outputs (a.k.a. the *target*)
+* *inputters*: the input layer of the model that defines how to read element and transform them into vectorized inputs
+
+## File format
+
+The format of the data files is defined by the `opennmt.inputters.Inputter` modules used by your model. OpenNMT-tf currently supports texts and sequence vectors as inputs.
 
 ### Text
 
-All `opennmt.inputters.TextInputter`s expect a text file as input where:
+All [`opennmt.inputters.TextInputter`](https://opennmt.net/OpenNMT-tf/package/opennmt.inputters.TextInputter.html) inputters expect a text file as input where:
 
 * sentences are separated by a **newline**
-* tokens are separated by a **space** (unless a custom tokenizer is set, see [Tokenization](tokenization.html))
+* tokens are separated by a **space** (unless a custom tokenizer is set, see [Tokenization](tokenization.md))
 
 For example:
 
@@ -22,9 +40,32 @@ Yes , we also say that the European budget is not about the duplication of natio
 The name of this site , and program name Title purchased will not be displayed .
 ```
 
-### Vectors
+### Sequence vector
 
-The `opennmt.inputters.SequenceRecordInputter` expects a file with serialized *TFRecords*. To simplify the preparation of these data, the script `onmt-ark-to-records` can be used to convert vectors serialized in the ARK text format:
+The `opennmt.inputters.SequenceRecordInputter` expects a file with serialized [*TFRecords*](https://www.tensorflow.org/tutorials/load_data/tfrecord). We propose 2 ways to create this file, choose the one that is the easiest for you:
+
+#### via Python
+
+It is very simple to generate a compatible *TFRecords* file directly from Python:
+
+```python
+import numpy as np
+import opennmt
+
+dataset = [
+  np.random.rand(8, 50),
+  np.random.rand(4, 50),
+  np.random.rand(13, 50)
+]
+
+opennmt.inputters.create_sequence_records(dataset, "data.records")
+```
+
+This example saves a dataset of 3 random vectors of shape `[time, dim]` into the file `data.records`. It should be easy to adapt for any dataset of 2D vectors.
+
+#### via the ARK text format
+
+The script `onmt-ark-to-records` proposes an alternative way to generate this dataset. It converts the ARK text format:
 
 ```text
 KEY [
@@ -37,26 +78,67 @@ which describes an example of `m` vectors of depth `n` and identified by `KEY`.
 
 See `onmt-ark-to-records -h` for the script usage. It also accepts an optional indexed text file (i.e. with lines prefixed with `KEY`s) to generate aligned source vectors and target texts.
 
-### Alignments
+## Parallel and nested inputs
 
-Guided alignment requires a training alignment file that uses the "Pharaoh" format, e.g.:
-
-```text
-0-0 1-1 2-4 3-2 4-3 5-5 6-6
-0-0 1-1 2-2 2-3 3-4 4-5
-0-0 1-2 2-1 3-3 4-4 5-5
-```
-
-where a pair `i-j` indicates that the `i`th word of the source sentence is aligned with the `j`th word of the target sentence (zero-indexed).
-
-This file should then be added in the data configuration:
+When using [`opennmt.inputters.ParallelInputter`](https://opennmt.net/OpenNMT-tf/package/opennmt.inputters.ParallelInputter.html) to define multi-source inputs, as many input files as inputters are expected. You have to configure your YAML file accordingly:
 
 ```yaml
 data:
-  train_alignments: train-alignment.txt
+  train_features_file:
+    - train_source_1.records
+    - train_source_2.txt
+    - train_source_3.txt
 ```
 
-and a guided alignment type should be set in the training configuration.
+`ParallelInputter` can also be nested to enable complex inputs combination. In this case, the nested structure should be replicated in the YAML file. The example below represents the configuration for a dual-source model where the first source combines the embeddings of words, POS tags, and case:
+
+```yaml
+data:
+  train_features_file:
+    - - source_1.txt
+      - source_1.txt.pos
+      - source_1.txt.case
+    - source_2.txt
+```
+
+During inference, the same number of input files should be provided. You should pass a **flattened** list of files to the `--features_file` command line option of the main script (e.g. for inference, evaluation, and scoring):
+
+```bash
+onmt.main [...] infer \
+    --features_file test_source_1.records test_source_2.txt test_source_3.txt
+```
+
+## Weighted inputs
+
+It is possible to configure multiple training data files and assign weights to each file:
+
+```yaml
+data:
+  train_features_file:
+    - domain_a.en
+    - domain_b.en
+    - domain_c.en
+  train_labels_file:
+    - domain_a.de
+    - domain_b.de
+    - domain_c.de
+  train_files_weights:
+    - 0.5
+    - 0.2
+    - 0.3
+```
+
+This configuration will create a weighted dataset where examples will be randomly sampled from the data files according to the provided weights. The weights are normalized by the file size so that examples from small files are not repeated more often than examples from large files during the training.
+
+## Compressed data
+
+Data files compressed with GZIP are supported. The path should end with the `.gz` extension for the file to be correctly loaded:
+
+```yaml
+data:
+  train_features_file: /data/wmt/train.en.gz
+  train_labels_file: /data/wmt/train.de.gz
+```
 
 ## Data location
 
@@ -72,22 +154,3 @@ For more information, see the TensorFlow documentation:
 
 * [How to run TensorFlow on Hadoop](https://www.tensorflow.org/deploy/hadoop)
 * [How to run TensorFlow on S3](https://www.tensorflow.org/deploy/s3)
-
-## Parallel inputs
-
-When using `opennmt.inputters.ParallelInputter`, as many input files as inputters are expected. You have to configure your YAML file accordingly:
-
-```yaml
-data:
-  train_features_file:
-    - train_source_1.records
-    - train_source_2.txt
-    - train_source_3.txt
-```
-
-Similarly, when using the `--features_file` command line option of the main script (e.g. for inference or scoring), a list of files must also be provided:
-
-```bash
-onmt.main infer [...] \
-    --features_file test_source_1.records test_source_2.txt test_source_3.txt
-```

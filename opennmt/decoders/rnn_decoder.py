@@ -1,471 +1,268 @@
 """Define RNN-based decoders."""
 
-import inspect
-
 import tensorflow as tf
+import tensorflow_addons as tfa
 
-from tensorflow.python.estimator.util import fn_args
+from opennmt.decoders import decoder
+from opennmt.layers import bridge
+from opennmt.layers import common
+from opennmt.layers import rnn
+from opennmt.layers import transformer
+from opennmt.layers.rnn import map_v1_weights_to_cell
 
-from opennmt.decoders.decoder import Decoder, logits_to_cum_log_probs, build_output_layer
-from opennmt.utils.cell import build_cell
-from opennmt.layers.reducer import align_in_time
 
-
-class RNNDecoder(Decoder):
+class RNNDecoder(decoder.Decoder):
   """A basic RNN decoder."""
 
   def __init__(self,
                num_layers,
                num_units,
-               bridge=None,
-               cell_class=tf.contrib.rnn.LSTMCell,
+               bridge_class=None,
+               cell_class=None,
                dropout=0.3,
-               residual_connections=False):
+               residual_connections=False,
+               **kwargs):
     """Initializes the decoder parameters.
 
     Args:
       num_layers: The number of layers.
       num_units: The number of units in each layer.
-      bridge: A :class:`opennmt.layers.bridge.Bridge` to pass the encoder state
-        to the decoder.
+      bridge_class: A :class:`opennmt.layers.Bridge` class to pass the
+        encoder state to the decoder. Default to
+        :class:`opennmt.layers.ZeroBridge`.
       cell_class: The inner cell class or a callable taking :obj:`num_units` as
-        argument and returning a cell.
+        argument and returning a cell. Defaults to a LSTM cell.
       dropout: The probability to drop units in each layer output.
       residual_connections: If ``True``, each layer input will be added to its
         output.
+      **kwargs: Additional layer arguments.
     """
-    self.num_layers = num_layers
-    self.num_units = num_units
-    self.bridge = bridge
-    self.cell_class = cell_class
+    super(RNNDecoder, self).__init__(**kwargs)
     self.dropout = dropout
-    self.residual_connections = residual_connections
+    self.cell = rnn.make_rnn_cell(
+        num_layers,
+        num_units,
+        dropout=dropout,
+        residual_connections=residual_connections,
+        cell_class=cell_class)
+    if bridge_class is None:
+      bridge_class = bridge.ZeroBridge
+    self.bridge = bridge_class()
 
-  def _init_state(self, zero_state, initial_state=None):
-    if initial_state is None:
-      return zero_state
-    elif self.bridge is None:
-      raise ValueError("A bridge must be configured when passing encoder state")
-    else:
-      return self.bridge(initial_state, zero_state)
-
-  def _build_cell(self,
-                  mode,
-                  batch_size,
-                  initial_state=None,
-                  memory=None,
-                  memory_sequence_length=None,
-                  dtype=None,
-                  alignment_history=False):
-    _ = memory_sequence_length
-    _ = alignment_history
-
-    if memory is None and dtype is None:
-      raise ValueError("dtype argument is required when memory is not set")
-
-    cell = build_cell(
-        self.num_layers,
-        self.num_units,
-        mode,
-        dropout=self.dropout,
-        residual_connections=self.residual_connections,
-        cell_class=self.cell_class)
-
-    initial_state = self._init_state(
-        cell.zero_state(batch_size, dtype or memory.dtype), initial_state=initial_state)
-
-    return cell, initial_state
-
-  def decode(self,
-             inputs,
-             sequence_length,
-             vocab_size=None,
-             initial_state=None,
-             sampling_probability=None,
-             embedding=None,
-             output_layer=None,
-             mode=tf.estimator.ModeKeys.TRAIN,
-             memory=None,
-             memory_sequence_length=None,
-             return_alignment_history=False):
-    _ = memory
-    _ = memory_sequence_length
-
-    batch_size = tf.shape(inputs)[0]
-
-    if (sampling_probability is not None
-        and (tf.contrib.framework.is_tensor(sampling_probability)
-             or sampling_probability > 0.0)):
-      if embedding is None:
-        raise ValueError("embedding argument must be set when using scheduled sampling")
-
-      tf.summary.scalar("sampling_probability", sampling_probability)
-      helper = tf.contrib.seq2seq.ScheduledEmbeddingTrainingHelper(
-          inputs,
-          sequence_length,
-          embedding,
-          sampling_probability)
-      fused_projection = False
-    else:
-      helper = tf.contrib.seq2seq.TrainingHelper(inputs, sequence_length)
-      fused_projection = True  # With TrainingHelper, project all timesteps at once.
-
-    cell, initial_state = self._build_cell(
-        mode,
-        batch_size,
-        initial_state=initial_state,
-        memory=memory,
-        memory_sequence_length=memory_sequence_length,
-        dtype=inputs.dtype,
-        alignment_history=return_alignment_history)
-
-    if output_layer is None:
-      output_layer = build_output_layer(self.num_units, vocab_size, dtype=inputs.dtype)
-
-    decoder = tf.contrib.seq2seq.BasicDecoder(
-        cell,
-        helper,
-        initial_state,
-        output_layer=output_layer if not fused_projection else None)
-
-    outputs, state, length = tf.contrib.seq2seq.dynamic_decode(decoder)
-
-    if fused_projection and output_layer is not None:
-      logits = output_layer(outputs.rnn_output)
-    else:
-      logits = outputs.rnn_output
-    # Make sure outputs have the same time_dim as inputs
-    inputs_len = tf.shape(inputs)[1]
-    logits = align_in_time(logits, inputs_len)
-
-    if return_alignment_history:
-      alignment_history = _get_alignment_history(state)
-      if alignment_history is not None:
-        alignment_history = align_in_time(alignment_history, inputs_len)
-      return (logits, state, length, alignment_history)
-    return (logits, state, length)
-
-  def dynamic_decode(self,
-                     embedding,
-                     start_tokens,
-                     end_token,
-                     vocab_size=None,
-                     initial_state=None,
-                     output_layer=None,
-                     maximum_iterations=250,
-                     mode=tf.estimator.ModeKeys.PREDICT,
-                     memory=None,
-                     memory_sequence_length=None,
-                     dtype=None,
-                     return_alignment_history=False):
-    batch_size = tf.shape(start_tokens)[0]
-
-    helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(
-        embedding,
-        start_tokens,
-        end_token)
-
-    cell, initial_state = self._build_cell(
-        mode,
-        batch_size,
-        initial_state=initial_state,
-        memory=memory,
-        memory_sequence_length=memory_sequence_length,
-        dtype=dtype,
-        alignment_history=return_alignment_history)
-
-    if output_layer is None:
-      output_layer = build_output_layer(self.num_units, vocab_size, dtype=dtype or memory.dtype)
-
-    decoder = tf.contrib.seq2seq.BasicDecoder(
-        cell,
-        helper,
-        initial_state,
-        output_layer=output_layer)
-
-    outputs, state, length = tf.contrib.seq2seq.dynamic_decode(
-        decoder, maximum_iterations=maximum_iterations)
-
-    predicted_ids = outputs.sample_id
-    log_probs = logits_to_cum_log_probs(outputs.rnn_output, length)
-
-    # Make shape consistent with beam search.
-    predicted_ids = tf.expand_dims(predicted_ids, 1)
-    length = tf.expand_dims(length, 1)
-    log_probs = tf.expand_dims(log_probs, 1)
-
-    if return_alignment_history:
-      alignment_history = _get_alignment_history(state)
-      if alignment_history is not None:
-        alignment_history = tf.expand_dims(alignment_history, 1)
-      return (predicted_ids, state, length, log_probs, alignment_history)
-    return (predicted_ids, state, length, log_probs)
-
-  def dynamic_decode_and_search(self,
-                                embedding,
-                                start_tokens,
-                                end_token,
-                                vocab_size=None,
-                                initial_state=None,
-                                output_layer=None,
-                                beam_width=5,
-                                length_penalty=0.0,
-                                maximum_iterations=250,
-                                mode=tf.estimator.ModeKeys.PREDICT,
-                                memory=None,
-                                memory_sequence_length=None,
-                                dtype=None,
-                                return_alignment_history=False):
-    if (return_alignment_history and
-        "reorder_tensor_arrays" not in fn_args(tf.contrib.seq2seq.BeamSearchDecoder.__init__)):
-      tf.logging.warn("The current version of tf.contrib.seq2seq.BeamSearchDecoder "
-                      "does not support returning the alignment history. None will "
-                      "be returned instead. Consider upgrading TensorFlow.")
-      alignment_history = False
-    else:
-      alignment_history = return_alignment_history
-
-    batch_size = tf.shape(start_tokens)[0]
-
-    # Replicate batch `beam_width` times.
+  def _get_initial_state(self, batch_size, dtype, initial_state=None):
+    cell_initial_state = self.cell.get_initial_state(batch_size=batch_size, dtype=dtype)
     if initial_state is not None:
-      initial_state = tf.contrib.seq2seq.tile_batch(
-          initial_state, multiplier=beam_width)
-    if memory is not None:
-      memory = tf.contrib.seq2seq.tile_batch(
-          memory, multiplier=beam_width)
-    if memory_sequence_length is not None:
-      memory_sequence_length = tf.contrib.seq2seq.tile_batch(
-          memory_sequence_length, multiplier=beam_width)
+      cell_initial_state = self.bridge(initial_state, cell_initial_state)
+    return cell_initial_state
 
-    cell, initial_state = self._build_cell(
-        mode,
-        batch_size * beam_width,
-        initial_state=initial_state,
-        memory=memory,
-        memory_sequence_length=memory_sequence_length,
-        dtype=dtype,
-        alignment_history=alignment_history)
-
-    if output_layer is None:
-      output_layer = build_output_layer(self.num_units, vocab_size, dtype=dtype or memory.dtype)
-
-    decoder = tf.contrib.seq2seq.BeamSearchDecoder(
-        cell,
-        embedding,
-        start_tokens,
-        end_token,
-        initial_state,
-        beam_width,
-        output_layer=output_layer,
-        length_penalty_weight=length_penalty)
-
-    outputs, beam_state, length = tf.contrib.seq2seq.dynamic_decode(
-        decoder, maximum_iterations=maximum_iterations)
-
-    predicted_ids = tf.transpose(outputs.predicted_ids, perm=[0, 2, 1])
-    log_probs = beam_state.log_probs
-    state = beam_state.cell_state
-
-    if return_alignment_history:
-      alignment_history = _get_alignment_history(state)
-      if alignment_history is not None:
-        alignment_history = tf.reshape(
-            alignment_history, [batch_size, beam_width, -1, tf.shape(memory)[1]])
-      return (predicted_ids, state, length, log_probs, alignment_history)
-    return (predicted_ids, state, length, log_probs)
-
-
-def _get_alignment_history(cell_state):
-  """Returns the alignment history from the cell state."""
-  if not hasattr(cell_state, "alignment_history") or cell_state.alignment_history == ():
-    return None
-  alignment_history = cell_state.alignment_history
-  if isinstance(alignment_history, tf.TensorArray):
-    alignment_history = alignment_history.stack()
-  alignment_history = tf.transpose(alignment_history, perm=[1, 0, 2])
-  return alignment_history
-
-def _build_attention_mechanism(attention_mechanism,
-                               num_units,
-                               memory,
-                               memory_sequence_length=None):
-  """Builds an attention mechanism from a class or a callable."""
-  if inspect.isclass(attention_mechanism):
-    kwargs = {}
-    if "dtype" in fn_args(attention_mechanism):
-      # For TensorFlow 1.5+, dtype should be set in the constructor.
-      kwargs["dtype"] = memory.dtype
-    return attention_mechanism(
-        num_units, memory, memory_sequence_length=memory_sequence_length, **kwargs)
-  elif callable(attention_mechanism):
-    return attention_mechanism(
-        num_units, memory, memory_sequence_length)
-  else:
-    raise ValueError("Unable to build the attention mechanism")
+  def step(self,
+           inputs,
+           timestep,
+           state=None,
+           memory=None,
+           memory_sequence_length=None,
+           training=None):
+    outputs, state = self.cell(inputs, state, training=training)
+    return outputs, state, None
 
 
 class AttentionalRNNDecoder(RNNDecoder):
-  """A RNN decoder with attention.
-
-  It simple overrides the cell construction to add an attention wrapper.
-  """
+  """A RNN decoder with attention."""
 
   def __init__(self,
                num_layers,
                num_units,
-               bridge=None,
-               attention_mechanism_class=tf.contrib.seq2seq.LuongAttention,
-               output_is_attention=True,
-               cell_class=tf.contrib.rnn.LSTMCell,
+               bridge_class=None,
+               attention_mechanism_class=None,
+               cell_class=None,
                dropout=0.3,
-               residual_connections=False):
+               residual_connections=False,
+               first_layer_attention=False,
+               attention_layer_activation=tf.math.tanh,
+               **kwargs):
     """Initializes the decoder parameters.
 
     Args:
       num_layers: The number of layers.
       num_units: The number of units in each layer.
-      bridge: A :class:`opennmt.layers.bridge.Bridge` to pass the encoder state
+      bridge: A :class:`opennmt.layers.Bridge` to pass the encoder state
         to the decoder.
       attention_mechanism_class: A class inheriting from
-        ``tf.contrib.seq2seq.AttentionMechanism`` or a callable that takes
-        ``(num_units, memory, memory_sequence_length)`` as arguments and returns
-        a ``tf.contrib.seq2seq.AttentionMechanism``.
-      output_is_attention: If ``True``, the final decoder output (before logits)
-        is the output of the attention layer. In all cases, the output of the
-        attention layer is passed to the next step.
+        ``tfa.seq2seq.AttentionMechanism``. Defaults to
+        ``tfa.seq2seq.LuongAttention``.
       cell_class: The inner cell class or a callable taking :obj:`num_units` as
         argument and returning a cell.
       dropout: The probability to drop units in each layer output.
       residual_connections: If ``True``, each layer input will be added to its
         output.
+      first_layer_attention: If ``True``, output attention after the first layer.
+      attention_layer_activation: The activation to produce the attentional hidden
+        state. Defaults to tanh following Luong paper (equation (5) in
+        https://arxiv.org/abs/1508.04025).
+      **kwargs: Additional layer arguments.
     """
     super(AttentionalRNNDecoder, self).__init__(
         num_layers,
         num_units,
-        bridge=bridge,
+        bridge_class=bridge_class,
         cell_class=cell_class,
         dropout=dropout,
-        residual_connections=residual_connections)
-    self.attention_mechanism_class = attention_mechanism_class
-    self.output_is_attention = output_is_attention
+        residual_connections=residual_connections,
+        **kwargs)
+    if attention_mechanism_class is None:
+      attention_mechanism_class = tfa.seq2seq.LuongAttention
+    self.attention_mechanism = attention_mechanism_class(self.cell.output_size)
 
-  def _build_cell(self,
-                  mode,
-                  batch_size,
-                  initial_state=None,
-                  memory=None,
-                  memory_sequence_length=None,
-                  dtype=None,
-                  alignment_history=False):
-    attention_mechanism = _build_attention_mechanism(
-        self.attention_mechanism_class,
-        self.num_units,
-        memory,
-        memory_sequence_length=memory_sequence_length)
+    def _add_attention(cell):
+      # Produce Luong-style attentional hidden states.
+      attention_layer = common.Dense(
+          cell.output_size,
+          use_bias=False,
+          activation=attention_layer_activation)
+      wrapper = tfa.seq2seq.AttentionWrapper(
+          cell,
+          self.attention_mechanism,
+          attention_layer=attention_layer)
+      return wrapper
 
-    cell, initial_cell_state = RNNDecoder._build_cell(
-        self,
-        mode,
-        batch_size,
-        initial_state=initial_state,
-        dtype=memory.dtype)
+    if first_layer_attention:
+      self.cell.cells[0] = _add_attention(self.cell.cells[0])
+    else:
+      self.cell = _add_attention(self.cell)
+    self.dropout = dropout
+    self.first_layer_attention = first_layer_attention
 
-    cell = tf.contrib.seq2seq.AttentionWrapper(
-        cell,
-        attention_mechanism,
-        attention_layer_size=self.num_units,
-        alignment_history=alignment_history,
-        output_attention=self.output_is_attention,
-        initial_cell_state=initial_cell_state)
+  @property
+  def support_alignment_history(self):
+    return True
 
-    if mode == tf.estimator.ModeKeys.TRAIN and self.dropout > 0.0:
-      cell = tf.contrib.rnn.DropoutWrapper(
-          cell, output_keep_prob=1.0 - self.dropout)
+  def _get_initial_state(self, batch_size, dtype, initial_state=None):
+    # Reset memory of attention mechanism.
+    self.attention_mechanism.setup_memory(
+        self.memory, memory_sequence_length=self.memory_sequence_length)
+    decoder_state = self.cell.get_initial_state(batch_size=batch_size, dtype=dtype)
+    if initial_state is not None:
+      if self.first_layer_attention:
+        cell_state = list(decoder_state)
+        cell_state[0] = decoder_state[0].cell_state
+        cell_state = self.bridge(initial_state, cell_state)
+        cell_state[0] = decoder_state[0].clone(cell_state=cell_state[0])
+        decoder_state = tuple(cell_state)
+      else:
+        cell_state = self.bridge(initial_state, decoder_state.cell_state)
+        decoder_state = decoder_state.clone(cell_state=cell_state)
+    return decoder_state
 
-    initial_state = cell.zero_state(batch_size, memory.dtype)
+  def step(self,
+           inputs,
+           timestep,
+           state=None,
+           memory=None,
+           memory_sequence_length=None,
+           training=None):
+    outputs, state = self.cell(inputs, state, training=training)
+    outputs = common.dropout(outputs, self.dropout, training=training)
+    if self.first_layer_attention:
+      attention = state[0].alignments
+    else:
+      attention = state.alignments
+    return outputs, state, attention
 
-    return cell, initial_state
+  def map_v1_weights(self, weights):
+    if (self.first_layer_attention
+        or not isinstance(self.attention_mechanism, tfa.seq2seq.LuongAttention)):
+      raise ValueError("Can only map V1 weights for RNN decoder with Luong attention "
+                       "on the last layer")
+    m = super(AttentionalRNNDecoder, self).map_v1_weights(weights)
+    m += common.Dense.map_v1_weights(
+        self.attention_mechanism.memory_layer, weights["memory_layer"])
+    weights = weights["decoder"]["attention_wrapper"]
+    # pylint: disable=protected-access
+    m += common.Dense.map_v1_weights(
+        self.cell._attention_layers[0], weights["attention_layer"])
+    m += map_v1_weights_to_cell(self.cell._cell, weights)
+    # pylint: enable=protected-access
+    return m
 
 
-class MultiAttentionalRNNDecoder(RNNDecoder):
-  """A RNN decoder with multi-attention.
-
-  This decoder can attend the encoder outputs after multiple RNN layers using
-  one or multiple attention mechanisms. Additionally, the cell state of this
-  decoder is not initialized from the encoder state (i.e. a
-  :class:`opennmt.layers.bridge.ZeroBridge` is imposed).
-  """
+class RNMTPlusDecoder(decoder.Decoder):
+  """The RNMT+ decoder described in https://arxiv.org/abs/1804.09849."""
 
   def __init__(self,
                num_layers,
                num_units,
-               attention_layers=None,
-               attention_mechanism_class=tf.contrib.seq2seq.LuongAttention,
-               cell_class=tf.contrib.rnn.LSTMCell,
+               num_heads,
                dropout=0.3,
-               residual_connections=False):
+               cell_class=None,
+               **kwargs):
     """Initializes the decoder parameters.
 
     Args:
       num_layers: The number of layers.
       num_units: The number of units in each layer.
-      attention_layers: A list of integers, the layers after which to add
-        attention. If ``None``, attention will only be added after the last
-        layer.
-      attention_mechanism_class: A class or list of classes inheriting from
-        ``tf.contrib.seq2seq.AttentionMechanism``. Alternatively, the class can
-        be replaced by a callable that takes
-        ``(num_units, memory, memory_sequence_length)`` as arguments and returns
-        a ``tf.contrib.seq2seq.AttentionMechanism``.
+      num_heads: The number of attention heads.
+      dropout: The probability to drop units from the decoder input and in each
+        layer output.
       cell_class: The inner cell class or a callable taking :obj:`num_units` as
-        argument and returning a cell.
-      dropout: The probability to drop units in each layer output.
-      residual_connections: If ``True``, each layer input will be added to its
-        output.
+        argument and returning a cell. Defaults to a layer normalized LSTM cell.
+      **kwargs: Additional layer arguments.
     """
-    super(MultiAttentionalRNNDecoder, self).__init__(
-        num_layers,
+    super(RNMTPlusDecoder, self).__init__(**kwargs)
+    if cell_class is None:
+      cell_class = tfa.rnn.LayerNormLSTMCell
+    self.num_heads = num_heads
+    self.num_units = num_units
+    self.dropout = dropout
+    self.cells = [cell_class(num_units) for _ in range(num_layers)]
+    self.multi_head_attention = transformer.MultiHeadAttention(
+        num_heads,
         num_units,
-        cell_class=cell_class,
         dropout=dropout,
-        residual_connections=residual_connections)
+        return_attention=True)
 
-    attention_layers = attention_layers or [-1]
-    attention_layers = [l % num_layers for l in attention_layers]
+  @property
+  def support_alignment_history(self):
+    return True
 
-    if not isinstance(attention_mechanism_class, list):
-      attention_mechanism_class = [attention_mechanism_class for _ in attention_layers]
+  def _get_initial_state(self, batch_size, dtype, initial_state=None):
+    return tuple(
+        cell.get_initial_state(batch_size=batch_size, dtype=dtype)
+        for cell in self.cells)
 
-    self.attention_mechanism_class = attention_mechanism_class
-    self.attention_layers = attention_layers
+  def step(self,
+           inputs,
+           timestep,
+           state=None,
+           memory=None,
+           memory_sequence_length=None,
+           training=None):
+    inputs = common.dropout(inputs, rate=self.dropout, training=training)
 
-  def _build_cell(self,
-                  mode,
-                  batch_size,
-                  initial_state=None,
-                  memory=None,
-                  memory_sequence_length=None,
-                  dtype=None,
-                  alignment_history=False):
-    attention_mechanisms = [
-        _build_attention_mechanism(
-            attention_mechanism,
-            self.num_units,
-            memory,
-            memory_sequence_length=memory_sequence_length)
-        for attention_mechanism in self.attention_mechanism_class]
+    new_states = []
+    last_outputs, state_0 = self.cells[0](inputs, state[0])
+    new_states.append(state_0)
 
-    cell = build_cell(
-        self.num_layers,
-        self.num_units,
-        mode,
-        dropout=self.dropout,
-        residual_connections=self.residual_connections,
-        cell_class=self.cell_class,
-        attention_layers=self.attention_layers,
-        attention_mechanisms=attention_mechanisms)
+    if memory_sequence_length is not None:
+      memory_mask = tf.sequence_mask(memory_sequence_length, maxlen=tf.shape(memory)[1])
+    else:
+      memory_mask = None
 
-    initial_state = cell.zero_state(batch_size, memory.dtype)
+    context, _, attention = self.multi_head_attention(
+        tf.expand_dims(last_outputs, 1),
+        memory=memory,
+        mask=memory_mask,
+        training=training)
+    attention = attention[:, 0, 0]  # Use the first head for the attention vector.
+    context = tf.squeeze(context, axis=1)
 
-    return cell, initial_state
+    for i in range(1, len(self.cells)):
+      inputs = tf.concat([last_outputs, context], axis=-1)
+      outputs, state_i = self.cells[i](inputs, state[i], training=training)
+      new_states.append(state_i)
+      outputs = common.dropout(outputs, rate=self.dropout, training=training)
+      if i >= 2:
+        outputs += last_outputs
+      last_outputs = outputs
+
+    final = tf.concat([last_outputs, context], -1)
+    return final, tuple(new_states), attention

@@ -1,71 +1,17 @@
 """Base class and functions for dynamic decoders."""
 
 import abc
-import six
 
 import tensorflow as tf
 
-from opennmt.layers.common import embedding_lookup
-from opennmt.utils.beam_search import get_state_shape_invariants
+from opennmt import constants
+from opennmt.inputters import text_inputter
+from opennmt.layers import common
+from opennmt.utils import decoding
+from opennmt.utils import misc
 
 
-def logits_to_cum_log_probs(logits, sequence_length):
-  """Returns the cumulated log probabilities of sequences.
-
-  Args:
-    logits: The sequence of logits of shape :math:`[B, T, ...]`.
-    sequence_length: The length of each sequence of shape :math:`[B]`.
-
-  Returns:
-    The cumulated log probability of each sequence.
-  """
-  mask = tf.sequence_mask(
-      sequence_length, maxlen=tf.shape(logits)[1], dtype=logits.dtype)
-  mask = tf.expand_dims(mask, -1)
-
-  log_probs = tf.nn.log_softmax(logits)
-  log_probs = log_probs * mask
-  log_probs = tf.reduce_max(log_probs, axis=-1)
-  log_probs = tf.reduce_sum(log_probs, axis=1)
-
-  return log_probs
-
-def get_embedding_fn(embedding):
-  """Returns the embedding function.
-
-  Args:
-    embedding: The embedding tensor or a callable that takes word ids.
-
-  Returns:
-    A callable that takes word ids.
-  """
-  if callable(embedding):
-    return embedding
-  else:
-    return lambda ids: embedding_lookup(embedding, ids)
-
-def build_output_layer(num_units, vocab_size, dtype=None):
-  """Builds the output projection layer.
-
-  Args:
-    num_units: The layer input depth.
-    vocab_size: The layer output depth.
-    dtype: The layer dtype.
-
-  Returns:
-    A ``tf.layers.Dense`` instance.
-
-  Raises:
-    ValueError: if :obj:`vocab_size` is ``None``.
-  """
-  if vocab_size is None:
-    raise ValueError("vocab_size must be set to build the output layer")
-
-  layer = tf.layers.Dense(vocab_size, use_bias=True, dtype=dtype)
-  layer.build([None, num_units])
-  return layer
-
-def get_sampling_probability(global_step,
+def get_sampling_probability(step,
                              read_probability=None,
                              schedule_type=None,
                              k=None):
@@ -73,9 +19,10 @@ def get_sampling_probability(global_step,
   https://arxiv.org/abs/1506.03099.
 
   Args:
-    global_step: The training step.
+    step: The training step.
     read_probability: The probability to read from the inputs.
-    schedule_type: The type of schedule.
+    schedule_type: The type of schedule: "constant", "linear", "exponential",
+      or "inverse_sigmoid".
     k: The convergence constant.
 
   Returns:
@@ -95,7 +42,7 @@ def get_sampling_probability(global_step,
     if k is None:
       raise ValueError("scheduled_sampling_k is required when scheduled_sampling_type is set")
 
-    step = tf.cast(global_step, tf.float32)
+    step = tf.cast(step, tf.float32)
     k = tf.constant(k, tf.float32)
 
     if schedule_type == "linear":
@@ -113,214 +60,397 @@ def get_sampling_probability(global_step,
   return 1.0 - read_probability
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Decoder(object):
+class Decoder(tf.keras.layers.Layer):
   """Base class for decoders."""
 
-  @abc.abstractmethod
-  def decode(self,
-             inputs,
-             sequence_length,
-             vocab_size=None,
-             initial_state=None,
-             sampling_probability=None,
-             embedding=None,
-             output_layer=None,
-             mode=tf.estimator.ModeKeys.TRAIN,
-             memory=None,
-             memory_sequence_length=None,
-             return_alignment_history=False):
-    """Decodes a full input sequence.
-
-    Usually used for training and evaluation where target sequences are known.
+  def __init__(self, num_sources=1, **kwargs):
+    """Initializes the decoder parameters.
 
     Args:
-      inputs: The input to decode of shape :math:`[B, T, ...]`.
-      sequence_length: The length of each input with shape :math:`[B]`.
-      vocab_size: The output vocabulary size. Must be set if :obj:`output_layer`
-        is not set.
-      initial_state: The initial state as a (possibly nested tuple of...) tensors.
-      sampling_probability: The probability of sampling categorically from
-        the output ids instead of reading directly from the inputs.
-      embedding: The embedding tensor or a callable that takes word ids.
-        Must be set when :obj:`sampling_probability` is set.
-      output_layer: Optional layer to apply to the output prior sampling.
-        Must be set if :obj:`vocab_size` is not set.
-      mode: A ``tf.estimator.ModeKeys`` mode.
-      memory: (optional) Memory values to query.
-      memory_sequence_length: (optional) Memory values length.
-      return_alignment_history: If ``True``, also returns the alignment
-        history from the attention layer (``None`` will be returned if
-        unsupported by the decoder).
+      num_sources: The number of source contexts expected by this decoder.
+      **kwargs: Additional layer arguments.
+
+    Raises:
+      ValueError: if the number of source contexts :obj:`num_sources` is not
+        supported by this decoder.
+    """
+    if num_sources < self.minimum_sources or num_sources > self.maximum_sources:
+      raise ValueError("This decoder accepts between %d and %d source contexts, "
+                       "but received %d" % (
+                           self.minimum_sources, self.maximum_sources, num_sources))
+    super(Decoder, self).__init__(**kwargs)
+    self.num_sources = num_sources
+    self.output_layer = None
+    self.memory = None
+    self.memory_sequence_length = None
+
+  @property
+  def minimum_sources(self):
+    """The minimum number of source contexts supported by this decoder."""
+    return 1
+
+  @property
+  def maximum_sources(self):
+    """The maximum number of source contexts supported by this decoder."""
+    return 1
+
+  @property
+  def support_alignment_history(self):
+    """Returns ``True`` if this decoder can return the attention as alignment
+    history."""
+    return False
+
+  @property
+  def initialized(self):
+    """Returns ``True`` if this decoder is initialized."""
+    return self.output_layer is not None
+
+  def initialize(self, vocab_size=None, output_layer=None):
+    """Initializes the decoder configuration.
+
+    Args:
+      vocab_size: The target vocabulary size.
+      output_layer: The output layer to use.
+
+    Raises:
+      ValueError: if both :obj:`vocab_size` and :obj:`output_layer` are not set.
+    """
+    if output_layer is not None:
+      self.output_layer = output_layer
+    else:
+      if vocab_size is None:
+        raise ValueError("One of vocab_size and output_layer must be set")
+      self.output_layer = common.Dense(vocab_size)
+
+  def reuse_embeddings(self, embeddings):
+    """Reuses embeddings in the decoder output layer.
+
+    Args:
+      embeddings: The embeddings matrix to reuse.
+
+    Raises:
+      RuntimeError: if the decoder was not initialized.
+    """
+    self._assert_is_initialized()
+    self.output_layer.set_kernel(embeddings, transpose=True)
+
+  def initial_state(self,
+                    memory=None,
+                    memory_sequence_length=None,
+                    initial_state=None,
+                    batch_size=None,
+                    dtype=None):
+    """Returns the initial decoder state.
+
+    Args:
+      memory: Memory values to query.
+      memory_sequence_length: Memory values length.
+      initial_state: An initial state to start from, e.g. the last encoder
+        state.
+      batch_size: The batch size to use.
+      dtype: The dtype of the state.
 
     Returns:
-      A tuple ``(outputs, state, sequence_length)`` or
-      ``(outputs, state, sequence_length, alignment_history)``
-      if :obj:`return_alignment_history` is ``True``.
+      A nested structure of tensors representing the decoder state.
+
+    Raises:
+      RuntimeError: if the decoder was not initialized.
+      ValueError: if one of :obj:`batch_size` or :obj:`dtype` is not set and
+        neither :obj:`initial_state` nor :obj:`memory` are not passed.
+      ValueError: if the number of source contexts (:obj:`memory`) does not
+        match the number defined at the decoder initialization.
+    """
+    self._assert_is_initialized()
+    self._assert_memory_is_compatible(memory, memory_sequence_length)
+    self.memory = memory
+    self.memory_sequence_length = memory_sequence_length
+    if batch_size is None or dtype is None:
+      sentinel = tf.nest.flatten(memory)[0]
+      if sentinel is None:
+        sentinel = tf.nest.flatten(initial_state)[0]
+      if sentinel is None:
+        raise ValueError("If batch_size or dtype are not set, then either "
+                         "memory or initial_state should be set")
+      if batch_size is None:
+        batch_size = tf.shape(sentinel)[0]
+      if dtype is None:
+        dtype = sentinel.dtype
+    return self._get_initial_state(batch_size, dtype, initial_state=initial_state)
+
+  # pylint: disable=arguments-differ
+  def call(self,
+           inputs,
+           length_or_step=None,
+           state=None,
+           input_fn=None,
+           sampling_probability=None,
+           training=None):
+    """Runs the decoder layer on either a complete sequence (e.g. for training
+    or scoring), or a single timestep (e.g. for iterative decoding).
+
+    Args:
+      inputs: The inputs to decode, can be a 3D (training) or 2D (iterative
+        decoding) tensor.
+      length_or_step: For 3D :obj:`inputs`, the length of each sequence. For 2D
+        :obj:`inputs`, the current decoding timestep.
+      state: The decoder state.
+      input_fn: A callable taking sampled ids and returning the decoding inputs.
+      sampling_probability: When :obj:`inputs` is the full sequence, the
+        probability to read from the last sample instead of the true target.
+      training: Run in training mode.
+
+    Returns:
+      A tuple with the logits, the decoder state, and an attention vector.
+
+    Raises:
+      RuntimeError: if the decoder was not initialized.
+      ValueError: if the :obj:`inputs` rank is different than 2 or 3.
+      ValueError: if :obj:`length_or_step` is invalid.
+    """
+    self._assert_is_initialized()
+    rank = inputs.shape.ndims
+    if rank == 2:
+      if length_or_step.shape.ndims != 0:
+        raise ValueError("length_or_step should be a scalar with the current timestep")
+      outputs, state, attention = self.step(
+          inputs,
+          length_or_step,
+          state=state,
+          memory=self.memory,
+          memory_sequence_length=self.memory_sequence_length,
+          training=training)
+      logits = self.output_layer(outputs)
+    elif rank == 3:
+      if length_or_step.shape.ndims != 1:
+        raise ValueError("length_or_step should contain the length of each sequence")
+      logits, state, attention = self.forward(
+          inputs,
+          sequence_length=length_or_step,
+          initial_state=state,
+          memory=self.memory,
+          memory_sequence_length=self.memory_sequence_length,
+          input_fn=input_fn,
+          sampling_probability=sampling_probability,
+          training=training)
+    else:
+      raise ValueError("Unsupported input rank %d" % rank)
+    return logits, state, attention
+
+  def forward(self,
+              inputs,
+              sequence_length=None,
+              initial_state=None,
+              memory=None,
+              memory_sequence_length=None,
+              input_fn=None,
+              sampling_probability=None,
+              training=None):
+    """Runs the decoder on full sequences.
+
+    Args:
+      inputs: The 3D decoder input.
+      sequence_length: The length of each input sequence.
+      initial_state: The initial decoder state.
+      memory: Memory values to query.
+      memory_sequence_length: Memory values length.
+      input_fn: A callable taking sampled ids and returning the decoding inputs.
+      sampling_probability: The probability to read from the last sample instead
+        of the true target.
+      training: Run in training mode.
+
+    Returns:
+      A tuple with the logits, the decoder state, and the attention
+      vector.
+    """
+    _ = sequence_length
+    fused_projection = True
+    if sampling_probability is not None:
+      if input_fn is None:
+        raise ValueError("input_fn is required when a sampling probability is set")
+      if not tf.is_tensor(sampling_probability) and sampling_probability == 0:
+        sampling_probability = None
+      else:
+        fused_projection = False
+        tf.summary.scalar("sampling_probability", sampling_probability)
+
+    batch_size, max_step, _ = misc.shape_list(inputs)
+    inputs_ta = tf.TensorArray(inputs.dtype, size=max_step)
+    inputs_ta = inputs_ta.unstack(tf.transpose(inputs, perm=[1, 0, 2]))
+
+    def _maybe_sample(true_inputs, logits):
+      # Read from samples with a probability.
+      draw = tf.random.uniform([batch_size])
+      read_sample = tf.less(draw, sampling_probability)
+      sampled_ids = tf.random.categorical(logits, 1)
+      sampled_inputs = input_fn(tf.squeeze(sampled_ids, 1))
+      inputs = tf.where(
+          tf.broadcast_to(tf.expand_dims(read_sample, -1), tf.shape(true_inputs)),
+          x=sampled_inputs,
+          y=true_inputs)
+      return inputs
+
+    def _body(step, state, inputs, outputs_ta, attention_ta):
+      outputs, state, attention = self.step(
+          inputs,
+          step,
+          state=state,
+          memory=memory,
+          memory_sequence_length=memory_sequence_length,
+          training=training)
+      next_inputs = tf.cond(
+          step + 1 < max_step,
+          true_fn=lambda: inputs_ta.read(step + 1),
+          false_fn=lambda: tf.zeros_like(inputs))
+      if not fused_projection:
+        outputs = self.output_layer(outputs)
+      if sampling_probability is not None:
+        next_inputs = _maybe_sample(next_inputs, outputs)
+      outputs_ta = outputs_ta.write(step, outputs)
+      if attention is not None:
+        attention_ta = attention_ta.write(step, attention)
+      return step + 1, state, next_inputs, outputs_ta, attention_ta
+
+    step = tf.constant(0, dtype=tf.int32)
+    outputs_ta = tf.TensorArray(inputs.dtype, size=max_step)
+    attention_ta = tf.TensorArray(tf.float32, size=max_step)
+
+    _, state, _, outputs_ta, attention_ta = tf.while_loop(
+        lambda *arg: True,
+        _body,
+        loop_vars=(step, initial_state, inputs_ta.read(0), outputs_ta, attention_ta),
+        parallel_iterations=32,
+        swap_memory=True,
+        maximum_iterations=max_step)
+
+    outputs = tf.transpose(outputs_ta.stack(), perm=[1, 0, 2])
+    logits = self.output_layer(outputs) if fused_projection else outputs
+    attention = None
+    if self.support_alignment_history:
+      attention = tf.transpose(attention_ta.stack(), perm=[1, 0, 2])
+    return logits, state, attention
+
+  @abc.abstractmethod
+  def step(self,
+           inputs,
+           timestep,
+           state=None,
+           memory=None,
+           memory_sequence_length=None,
+           training=None):
+    """Runs one decoding step.
+
+    Args:
+      inputs: The 2D decoder input.
+      timestep: The current decoding step.
+      state: The decoder state.
+      memory: Memory values to query.
+      memory_sequence_length: Memory values length.
+      training: Run in training mode.
+
+    Returns:
+      A tuple with the decoder outputs, the decoder state, and the attention
+      vector.
     """
     raise NotImplementedError()
 
-  @abc.abstractmethod
   def dynamic_decode(self,
-                     embedding,
-                     start_tokens,
-                     end_token,
-                     vocab_size=None,
+                     embeddings,
+                     start_ids,
+                     end_id=constants.END_OF_SENTENCE_ID,
                      initial_state=None,
-                     output_layer=None,
-                     maximum_iterations=250,
-                     mode=tf.estimator.ModeKeys.PREDICT,
-                     memory=None,
-                     memory_sequence_length=None,
-                     dtype=None,
-                     return_alignment_history=False):
-    """Decodes dynamically from :obj:`start_tokens` with greedy search.
-
-    Usually used for inference.
+                     decoding_strategy=None,
+                     sampler=None,
+                     maximum_iterations=None,
+                     minimum_iterations=0):
+    """Decodes dynamically from :obj:`start_ids`.
 
     Args:
-      embedding: The embedding tensor or a callable that takes word ids.
-      start_tokens: The start token ids with shape :math:`[B]`.
-      end_token: The end token id.
-      vocab_size: The output vocabulary size. Must be set if :obj:`output_layer`
-        is not set.
-      initial_state: The initial state as a (possibly nested tuple of...) tensors.
-      output_layer: Optional layer to apply to the output prior sampling.
-        Must be set if :obj:`vocab_size` is not set.
-      maximum_iterations: The maximum number of decoding iterations.
-      mode: A ``tf.estimator.ModeKeys`` mode.
-      memory: (optional) Memory values to query.
-      memory_sequence_length: (optional) Memory values length.
-      dtype: The data type. Required if :obj:`memory` is ``None``.
-      return_alignment_history: If ``True``, also returns the alignment
-        history from the attention layer (``None`` will be returned if
-        unsupported by the decoder).
+      embeddings: Target embeddings or :class:`opennmt.inputters.WordEmbedder`
+        to apply on decoded ids.
+      start_ids: Initial input IDs of shape :math:`[B]`.
+      end_id: ID of the end of sequence token.
+      initial_state: Initial decoder state.
+      decoding_strategy: A :class:`opennmt.utils.DecodingStrategy`
+        instance that define the decoding logic. Defaults to a greedy search.
+      sampler: A :class:`opennmt.utils.Sampler` instance that samples
+        predictions from the model output. Defaults to an argmax sampling.
+      maximum_iterations: The maximum number of iterations to decode for.
+      minimum_iterations: The minimum number of iterations to decode for.
 
     Returns:
-      A tuple ``(predicted_ids, state, sequence_length, log_probs)`` or
-      ``(predicted_ids, state, sequence_length, log_probs, alignment_history)``
-      if :obj:`return_alignment_history` is ``True``.
+      A :class:`opennmt.utils.DecodingResult` instance.
+
+    See Also:
+      :func:`opennmt.utils.dynamic_decode`
     """
-    raise NotImplementedError()
+    if isinstance(embeddings, text_inputter.WordEmbedder):
+      input_fn = lambda ids: embeddings({"ids": ids})
+    else:
+      input_fn = lambda ids: tf.nn.embedding_lookup(embeddings, ids)
+
+    # TODO: find a better way to pass the state reorder flags.
+    if hasattr(decoding_strategy, "_set_state_reorder_flags"):
+      state_reorder_flags = self._get_state_reorder_flags()
+      decoding_strategy._set_state_reorder_flags(state_reorder_flags)  # pylint: disable=protected-access
+
+    return decoding.dynamic_decode(
+        lambda ids, step, state: self(input_fn(ids), step, state),
+        start_ids,
+        end_id=end_id,
+        initial_state=initial_state,
+        decoding_strategy=decoding_strategy,
+        sampler=sampler,
+        maximum_iterations=maximum_iterations,
+        minimum_iterations=minimum_iterations,
+        attention_history=self.support_alignment_history,
+        attention_size=tf.shape(self.memory)[1] if self.support_alignment_history else None)
+
+  def map_v1_weights(self, weights):
+    return self.output_layer.map_v1_weights(weights["dense"])
 
   @abc.abstractmethod
-  def dynamic_decode_and_search(self,
-                                embedding,
-                                start_tokens,
-                                end_token,
-                                vocab_size=None,
-                                initial_state=None,
-                                output_layer=None,
-                                beam_width=5,
-                                length_penalty=0.0,
-                                maximum_iterations=250,
-                                mode=tf.estimator.ModeKeys.PREDICT,
-                                memory=None,
-                                memory_sequence_length=None,
-                                dtype=None,
-                                return_alignment_history=False):
-    """Decodes dynamically from :obj:`start_tokens` with beam search.
-
-    Usually used for inference.
+  def _get_initial_state(self, batch_size, dtype, initial_state=None):
+    """Returns the decoder initial state.
 
     Args:
-      embedding: The embedding tensor or a callable that takes word ids.
-      start_tokens: The start token ids with shape :math:`[B]`.
-      end_token: The end token id.
-      vocab_size: The output vocabulary size. Must be set if :obj:`output_layer`
-        is not set.
-      initial_state: The initial state as a (possibly nested tuple of...) tensors.
-      output_layer: Optional layer to apply to the output prior sampling.
-        Must be set if :obj:`vocab_size` is not set.
-      beam_width: The width of the beam.
-      length_penalty: The length penalty weight during beam search.
-      maximum_iterations: The maximum number of decoding iterations.
-      mode: A ``tf.estimator.ModeKeys`` mode.
-      memory: (optional) Memory values to query.
-      memory_sequence_length: (optional) Memory values length.
-      dtype: The data type. Required if :obj:`memory` is ``None``.
-      return_alignment_history: If ``True``, also returns the alignment
-        history from the attention layer (``None`` will be returned if
-        unsupported by the decoder).
+      batch_size: The batch size of the returned state.
+      dtype; The data type of the state.
+      initial_state: A state to start from.
 
     Returns:
-      A tuple ``(predicted_ids, state, sequence_length, log_probs)`` or
-      ``(predicted_ids, state, sequence_length, log_probs, alignment_history)``
-      if :obj:`return_alignment_history` is ``True``.
+      The decoder state as a nested structure of tensors.
     """
     raise NotImplementedError()
 
+  def _get_state_reorder_flags(self):
+    """Returns a structure that marks states that should be reordered during beam search.
+    By default all states are reordered.
 
-def greedy_decode(symbols_to_logits_fn,
-                  initial_ids,
-                  end_id,
-                  decode_length=None,
-                  state=None,
-                  return_state=False):
-  """Greedily decodes from :obj:`initial_ids`.
+    Returns:
+      The same structure as the decoder state with tensors replaced by booleans.
+    """
+    return None
 
-  Args:
-    symbols_to_logits_fn: Interface to the model, to provide logits.
-        Shoud take [batch_size, decoded_ids] and return [batch_size, vocab_size].
-    initial_ids: Ids to start off the decoding, this will be the first thing
-        handed to symbols_to_logits_fn.
-    eos_id: ID for end of sentence.
-    decode_length: Maximum number of steps to decode for.
-    states: A dictionnary of (possibly nested) decoding states.
-    return_state: If ``True``, also return the updated decoding states.
+  def _assert_is_initialized(self):
+    """Raises an expection if the decoder was not initialized."""
+    if not self.initialized:
+      raise RuntimeError("The decoder was not initialized")
 
-  Returns:
-    A tuple with the decoded output, the decoded lengths, the log probabilities,
-    and the decoding states (if :obj:`return_state` is ``True``).
-  """
-  batch_size = tf.shape(initial_ids)[0]
-  finished = tf.tile([False], [batch_size])
-  step = tf.constant(0)
-  inputs = tf.expand_dims(initial_ids, 1)
-  lengths = tf.zeros([batch_size], dtype=tf.int32)
-  log_probs = tf.zeros([batch_size])
+  def _assert_memory_is_compatible(self, memory, memory_sequence_length):
+    """Raises an expection if the memory layout is not compatible with this decoder."""
 
-  def _condition(unused_step, finished, unused_inputs,
-                 unused_lengths, unused_log_probs, unused_state):
-    return tf.logical_not(tf.reduce_all(finished))
+    def _num_elements(obj):
+      if obj is None:
+        return 0
+      elif isinstance(obj, (list, tuple)):
+        return len(obj)
+      else:
+        return 1
 
-  def _body(step, finished, inputs, lengths, log_probs, state):
-    inputs_lengths = tf.add(lengths, 1 - tf.cast(finished, lengths.dtype))
-
-    logits, state = symbols_to_logits_fn(inputs, step, state)
-    probs = tf.nn.log_softmax(logits)
-    sample_ids = tf.argmax(probs, axis=-1)
-
-    # Accumulate log probabilities.
-    sample_probs = tf.reduce_max(probs, axis=-1)
-    masked_probs = tf.squeeze(sample_probs, -1) * (1.0 - tf.cast(finished, sample_probs.dtype))
-    log_probs = tf.add(log_probs, masked_probs)
-
-    next_inputs = tf.concat([inputs, tf.cast(sample_ids, inputs.dtype)], -1)
-    next_lengths = inputs_lengths
-    next_finished = tf.logical_or(
-        finished,
-        tf.equal(tf.squeeze(sample_ids, axis=[1]), end_id))
-    step = step + 1
-
-    if decode_length is not None:
-      next_finished = tf.logical_or(next_finished, step >= decode_length)
-
-    return step, next_finished, next_inputs, next_lengths, log_probs, state
-
-  _, _, outputs, lengths, log_probs, state = tf.while_loop(
-      _condition,
-      _body,
-      loop_vars=(step, finished, inputs, lengths, log_probs, state),
-      shape_invariants=(
-          tf.TensorShape([]),
-          finished.get_shape(),
-          tf.TensorShape([None, None]),
-          lengths.get_shape(),
-          log_probs.get_shape(),
-          tf.contrib.framework.nest.map_structure(get_state_shape_invariants, state)),
-      parallel_iterations=1)
-
-  if return_state:
-    return outputs, lengths, log_probs, state
-  return outputs, lengths, log_probs
+    num_memory = _num_elements(memory)
+    num_length = _num_elements(memory_sequence_length)
+    if num_memory != num_length and memory_sequence_length is not None:
+      raise ValueError("got %d memory values but %d length vectors" % (num_memory, num_length))
+    if num_memory != self.num_sources:
+      raise ValueError("expected %d source contexts, but got %d" % (
+          self.num_sources, num_memory))
